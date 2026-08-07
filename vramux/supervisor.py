@@ -28,6 +28,7 @@ from typing import Callable, List, Optional
 import aiohttp
 
 from . import env
+from .observer import Observer
 from .registry import KIND_DOCKER, ModelSpec
 
 log = logging.getLogger("vramux.supervisor")
@@ -89,6 +90,10 @@ class ProcessBackend:
 
     def alive(self) -> bool:
         return self._proc is not None and self._proc.returncode is None
+
+    async def pids(self) -> List[int]:
+        """The process holding VRAM is the one we spawned."""
+        return [self._proc.pid] if self._proc is not None else []
 
     async def start(self, spec: ModelSpec, startup_timeout: float) -> None:
         binary = resolve_llama_server_bin()
@@ -169,6 +174,33 @@ class ProcessBackend:
             self._stderr_fh = None
 
 
+def parse_compose_top(out: str) -> List[int]:
+    """Pull host PIDs out of `docker compose top`.
+
+    The column layout is not stable across compose versions — some emit the
+    bare `ps` header (`UID PID PPID ...`), newer ones prefix `SERVICE` and a
+    replica number. Reading a fixed column index silently collects the wrong
+    number, so the header is what decides: find `PID` in it, and use that
+    position until the next header.
+    """
+    pids: List[int] = []
+    pid_column = None
+    for line in out.splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        if "PID" in fields:
+            pid_column = fields.index("PID")
+            continue
+        if pid_column is None or len(fields) <= pid_column:
+            continue
+        try:
+            pids.append(int(fields[pid_column]))
+        except ValueError:
+            continue
+    return pids
+
+
 class DockerComposeBackend:
     """A compose service that ships its own OpenAI-compatible server.
 
@@ -188,6 +220,21 @@ class DockerComposeBackend:
 
     def alive(self) -> bool:
         return self._started
+
+    async def pids(self) -> List[int]:
+        """Host PIDs of the container's processes, best effort.
+
+        `docker compose top` reports host PIDs, and NVML reports host PIDs for
+        container compute processes, so the two meet — verified against a real
+        container backend. This only affects whether a load is attributed or
+        counted as foreign, never whether it proceeds.
+        """
+        if not self._started:
+            return []
+        rc, out = await self._run("top", self.spec.compose_service, timeout=15)
+        if rc != 0:
+            return []
+        return parse_compose_top(out)
 
     def _compose(self, *args: str) -> List[str]:
         return [
@@ -271,9 +318,13 @@ class LlamaServerSupervisor:
         idle_timeout: float = 900.0,  # 15min, matches OLLAMA_KEEP_ALIVE=15m
         startup_timeout: float = 180.0,
         drain_timeout: float = 120.0,
+        observer: Optional[Observer] = None,
     ) -> None:
         self.host = host
         self.port = port
+        # None disables observation entirely. It only ever watches, so nothing
+        # below is allowed to change whether a load succeeds.
+        self.observer = observer
         self.idle_timeout = idle_timeout
         self.startup_timeout = startup_timeout
         self.drain_timeout = drain_timeout
@@ -419,20 +470,42 @@ class LlamaServerSupervisor:
         if spec.kind == KIND_DOCKER:
             startup_timeout = max(startup_timeout, 600.0)
         try:
-            await backend.start(spec, startup_timeout)
+            if self.observer is None:
+                await backend.start(spec, startup_timeout)
+            else:
+                async with self.observer.measuring(spec):
+                    await backend.start(spec, startup_timeout)
+                    # Claim before the window closes, or the process we just
+                    # started reads as foreign drift and voids its own
+                    # measurement.
+                    self.observer.claim(spec.tag, await self._backend_pids(backend))
         except Exception:
             await self._stop_unlocked()
             raise
         self._ensure_idle_watcher()
 
+    async def _backend_pids(self, backend) -> List[int]:
+        try:
+            return await backend.pids()
+        except Exception as exc:  # attribution is a nicety, never a blocker
+            log.debug("could not determine pids for the running backend: %s", exc)
+            return []
+
     async def _stop_unlocked(self) -> None:
         if self._backend is None:
             return
+        tag = self.current_tag
+        before = None
+        if self.observer is not None:
+            before = await self.observer._safe_snapshot()
         try:
             await self._backend.stop()
         finally:
             self._backend = None
             self._current = None
+        if self.observer is not None and tag is not None:
+            self.observer.release(tag)
+            await self.observer.observe_unload(tag, before)
 
     async def stop(self) -> None:
         async with self._lock:

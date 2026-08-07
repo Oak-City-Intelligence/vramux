@@ -431,9 +431,12 @@ different implementation, so nothing is thrown away.
 ## 13. Open questions
 
 - Does `/gpu/state` need to be streamable for a live view, or is polling fine?
-- PID attribution for container-resident leaseholders (§5.2) assumes NVML
-  reports host PIDs for container processes. True in the common case; needs
-  testing against real container stacks before v0.2.
+- ~~PID attribution for container-resident leaseholders (§5.2) assumes NVML
+  reports host PIDs for container processes.~~ **Answered.** Verified against a
+  real container backend: `docker compose top` and NVML agree on host PIDs, and
+  the container's compute process attributes correctly. Note that the compose
+  column layout varies by version, so the PID column must be read from the
+  header rather than by index.
 - Is per-consumer priority worth configuring, or is a two-level
   interactive/batch split enough?
 - Multi-GPU: device index is threaded through from the start, but placement

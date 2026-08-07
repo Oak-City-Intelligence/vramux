@@ -43,9 +43,9 @@ These constrain every stage. They are why the ordering looks conservative.
 
 ## Current state (2026-08-07)
 
-**Stages 0 and 1 are done.** Stage 2, the observer, is next.
+**Stages 0, 1 and 2 are done.** Stage 3, the structural refactor, is next.
 
-- ~1,450 lines across five modules; 81 tests, all GPU-less
+- ~1,900 lines across seven modules; 119 tests, all GPU-less
 - single slot, one backend at a time, swap verified working both directions
   (17 s cold container, 7 s container→GGUF, 16 s back)
 - under git at its final location, serving `:11434` from there as
@@ -147,7 +147,7 @@ no model directory: it came up and served `/api/tags` as an empty list rather
 than failing. No tracked file contains an absolute path to the machine it was
 written on.
 
-## Stage 2 — The observer
+## Stage 2 — The observer — DONE (2026-08-07)
 
 **The highest-leverage stage, and it changes no behaviour at all.**
 
@@ -171,6 +171,14 @@ that has to work, and it is the observer's most useful first subject.
 **Exit:** `vramux state` prints a true picture of the card, including processes
 vramux has never heard of. Cost cache has real entries for every model that has
 been loaded since the observer landed.
+
+Met, and it settled an open question early. Container PID attribution — the
+assumption flagged in `DESIGN.md` §13 and deferred to Stage 5 — was tested here
+because implementing attribution required it: `docker compose top` reports host
+PIDs, NVML reports host PIDs for container compute processes, and they match.
+Both backend kinds are now attributed and measured. The first parser read the
+wrong column, which is worth remembering: a fixed column index silently
+collects a plausible wrong number, so the header decides.
 
 ## Stage 3 — Structure
 
@@ -284,7 +292,7 @@ subject.
 |---|---|---|
 | refactor breaks the daily driver | 3 | Stage 0 tests land first and stay unedited |
 | cost underestimate → OOM kills innocent resident | 6 | Stage 2 collects real data for weeks first; budget shut until then |
-| container PID attribution doesn't work | 5 | client 3, after 1 and 2 have already paid out |
+| ~~container PID attribution doesn't work~~ | ~~5~~ | **retired at Stage 2** — verified working against a real container backend |
 | clients never migrate | 5 | CLI wrapper must be shorter than the hack it replaces |
 | codebase forks and diverges | 1a | move, never copy; develop against the live service |
 | publishing pressure distorts priorities | any | publishing has no deadline and drives no decision |

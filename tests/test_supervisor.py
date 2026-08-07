@@ -41,6 +41,9 @@ class FakeBackend:
         self.started = True
         self.events.append(f"start:{spec.tag}")
 
+    async def pids(self):
+        return [4242] if self.started else []
+
     async def stop(self) -> None:
         if self.started:
             self.events.append(f"stop:{self.spec.tag}")
@@ -269,3 +272,82 @@ async def test_reconcile_failure_does_not_block_startup(monkeypatch):
 
     monkeypatch.setattr(sup_mod, "DockerComposeBackend", ExplodingDocker)
     await FakeSupervisor().reconcile([spec("d:35b", kind=KIND_DOCKER)])
+
+
+# ---- observation ----------------------------------------------------------
+
+
+class RecordingObserver:
+    """Stands in for the real observer: records the calls, decides nothing."""
+
+    def __init__(self) -> None:
+        self.claims = []
+        self.releases = []
+        self.measured = []
+        self.unloads = []
+
+    def claim(self, owner, pids=()):
+        self.claims.append((owner, list(pids)))
+
+    def release(self, owner):
+        self.releases.append(owner)
+
+    async def _safe_snapshot(self):
+        return "snapshot"
+
+    async def observe_unload(self, tag, before):
+        self.unloads.append((tag, before))
+
+    def measuring(self, spec):
+        observer = self
+
+        class _Ctx:
+            async def __aenter__(self):
+                observer.measured.append(spec.tag)
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return _Ctx()
+
+
+async def test_a_load_is_measured_and_its_pids_claimed():
+    obs = RecordingObserver()
+    sup = FakeSupervisor(observer=obs)
+    await sup.acquire(spec("a:1b"))
+    assert obs.measured == ["a:1b"]
+    # Claimed inside the measurement window, or the process just started reads
+    # as foreign drift and voids its own measurement.
+    assert obs.claims == [("a:1b", [4242])]
+
+
+async def test_an_unload_releases_the_claim_and_is_observed():
+    obs = RecordingObserver()
+    sup = FakeSupervisor(observer=obs)
+    await sup.acquire(spec("a:1b"))
+    sup.release()
+    await sup.stop()
+    assert obs.releases == ["a:1b"]
+    assert obs.unloads == [("a:1b", "snapshot")]
+
+
+async def test_a_backend_that_cannot_report_pids_still_loads():
+    class NoPids(FakeBackend):
+        async def pids(self):
+            raise RuntimeError("docker compose top failed")
+
+    obs = RecordingObserver()
+    sup = FakeSupervisor(observer=obs)
+    sup._make_backend = lambda spec_: NoPids(spec_, sup.events)
+    await sup.acquire(spec("d:35b", kind=KIND_DOCKER))
+    assert sup.current_tag == "d:35b"
+    assert obs.claims == [("d:35b", [])]
+
+
+async def test_observation_is_optional():
+    """The supervisor must run identically with no observer attached."""
+    sup = FakeSupervisor(observer=None)
+    await sup.acquire(spec("a:1b"))
+    sup.release()
+    await sup.stop()
+    assert sup.events == ["start:a:1b", "stop:a:1b"]

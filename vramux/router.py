@@ -105,6 +105,39 @@ class Router:
         entry["expires_at"] = "0001-01-01T00:00:00Z"
         return web.json_response({"models": [entry]})
 
+    async def gpu_state(self, _request: web.Request) -> web.Response:
+        """What is on the card right now, with ownership resolved.
+
+        Read-only, and it is the only place ownership can be resolved: the
+        observer that knows which PIDs vramux started lives in this process.
+        A CLI asking from outside would see every process as foreign.
+        """
+        observer = self.supervisor.observer
+        if observer is None:
+            return web.json_response({"error": "observation disabled"}, status=503)
+        snap = await observer.snapshot()
+        if snap is None:
+            return web.json_response({"error": "no GPU visible"}, status=503)
+        return web.json_response({
+            "device": {
+                "index": snap.device.index,
+                "name": snap.device.name,
+                "total_mb": snap.device.total_mb,
+                "used_mb": snap.device.used_mb,
+                "free_mb": snap.device.free_mb,
+                "unattributed_mb": snap.device.unattributed_mb,
+            },
+            "recognised_mb": snap.recognised_mb,
+            "foreign_mb": snap.foreign_mb,
+            "processes": [
+                {"pid": a.process.pid, "used_mb": a.process.used_mb,
+                 "name": a.process.name, "owner": a.owner}
+                for a in snap.attributions
+            ],
+            "unlocated_owners": snap.unlocated_owners,
+            "costs": observer.cache.all(),
+        })
+
     async def pull(self, _request: web.Request) -> web.Response:
         # Models are managed out-of-band (GGUFs are local files). No-op success.
         return web.json_response({"status": "success"})
@@ -569,6 +602,7 @@ def make_app(registry: ModelRegistry, supervisor: LlamaServerSupervisor) -> web.
     app.router.add_get("/api/version", r.version)
     app.router.add_get("/api/tags", r.list_tags)
     app.router.add_get("/api/ps", r.ps)
+    app.router.add_get("/gpu/state", r.gpu_state)
     app.router.add_post("/api/show", r.show)
     app.router.add_post("/api/chat", r.chat)
     app.router.add_post("/api/generate", r.generate)
