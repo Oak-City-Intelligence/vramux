@@ -49,18 +49,24 @@ These constrain every stage. They are why the ordering looks conservative.
    either moves code or changes what it does. Never both — that is the only way
    a regression stays diagnosable.
 
-## Current state
+## Current state (2026-08-07)
 
-- 1,370 lines across four modules, no tests
+**Stages 0 and 1 are done.** Stage 2, the observer, is next.
+
+- ~1,450 lines across five modules; 81 tests, all GPU-less
 - single slot, one backend at a time, swap verified working both directions
   (17 s cold container, 7 s container→GGUF, 16 s back)
-- hardcoded paths to `<home>` and `<data-mount>`
-- `MYLLAMA_*` env prefix, `the old unit` user unit
-- GPU currently occupied by a training run — see "Working around the GPU"
+- lives at `<final-location>/`, under git, and serves `:11434`
+  from there as `vramux.service` (`the old unit` kept as an alias)
+- no path resolves to this machine; a clean checkout with an empty environment
+  starts and serves
+- `VRAMUX_*` env prefix; the old `MYLLAMA_*` names shim with a one-time warning
+- the training run has finished, so the GPU is free — Stage 6 is unblocked
+  whenever the Stage 2 dataset justifies starting it
 
 ---
 
-## Stage 0 — Safety net
+## Stage 0 — Safety net — DONE (2026-08-07)
 
 **Do this first, and it needs no GPU.**
 
@@ -82,7 +88,11 @@ CI-able later.
 **Exit:** a red test can be produced by reverting any of last session's fixes.
 That is the real acceptance criterion, not coverage percentage.
 
-## Stage 1 — Move and identity
+Met. Each of the five fixes was reverted in turn and the suite went red each
+time: the `[DONE]` guard (7 failures), the tool-call accumulator (6), the
+health recycle (1), the drain wait (1), and `reconcile()`'s docker filter (1).
+
+## Stage 1 — Move and identity — DONE (2026-08-07)
 
 ### 1a. Move, do not fork
 
@@ -139,6 +149,11 @@ better. It comes as a side effect, not a goal, and there is no deadline on it.
 
 **Exit:** clean checkout runs on a machine that is not this one. No test asserts
 a path under `/home`.
+
+Met. A fresh clone started under `env -i` with a foreign `HOME`, no config and
+no model directory: it came up and served `/api/tags` as an empty list rather
+than failing. No tracked source, test or config file mentions `<home>` or
+`<data-mount>`.
 
 ## Stage 2 — The observer
 
