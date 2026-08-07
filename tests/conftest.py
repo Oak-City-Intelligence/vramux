@@ -83,7 +83,7 @@ async def collect(agen: AsyncIterator[bytes]) -> List[Dict[str, Any]]:
 def isolated_registry(monkeypatch, tmp_path):
     """Point the ollama-blob discovery at an empty tree so tests never see
     this machine's real model store."""
-    from llama_router import registry as reg
+    from vramux import registry as reg
 
     empty = tmp_path / "no-ollama"
     monkeypatch.setattr(reg, "MANIFESTS_ROOT", empty)

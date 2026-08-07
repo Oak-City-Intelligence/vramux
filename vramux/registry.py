@@ -8,7 +8,6 @@ fallback hard-coded mapping that covers the models present in
 from __future__ import annotations
 
 import json
-import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,14 +15,16 @@ from typing import Dict, List, Optional
 
 import yaml
 
+from . import env
+
 
 OLLAMA_MODELS_ROOT = Path("/usr/share/ollama/.ollama/models")
 MANIFESTS_ROOT = OLLAMA_MODELS_ROOT / "manifests" / "registry.ollama.ai" / "library"
 BLOBS_ROOT = OLLAMA_MODELS_ROOT / "blobs"
 
-DEFAULT_MODEL_DIR = Path(os.environ.get("MYLLAMA_MODEL_DIR", "<model-dir>"))
+DEFAULT_MODEL_DIR = Path(env.get("MODEL_DIR", "<model-dir>"))
 DEFAULT_CONFIG_FILE = Path(
-    os.environ.get("MYLLAMA_MODELS_CONFIG", str(Path(__file__).resolve().parent.parent / "models.yml"))
+    env.get("MODELS_CONFIG", str(Path(__file__).resolve().parent.parent / "models.yml"))
 )
 
 

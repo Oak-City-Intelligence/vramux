@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from llama_router.registry import KIND_DOCKER, KIND_LLAMA_SERVER, ModelRegistry, ModelSpec
+from vramux.registry import KIND_DOCKER, KIND_LLAMA_SERVER, ModelRegistry, ModelSpec
 
 
 def write_yaml(path: Path, models: dict) -> Path:

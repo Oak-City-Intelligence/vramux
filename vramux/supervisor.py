@@ -26,16 +26,14 @@ from typing import Callable, List, Optional
 
 import aiohttp
 
+from . import env
 from .registry import KIND_DOCKER, ModelSpec
 
-log = logging.getLogger("vramux.llamacpp.supervisor")
+log = logging.getLogger("vramux.supervisor")
 
 
 LLAMA_SERVER_BIN = Path(
-    os.environ.get(
-        "LLAMA_SERVER_BIN",
-        "<llama.cpp-build>/llama-server
-    )
+    env.get("LLAMA_SERVER_BIN", "<llama.cpp-build>/llama-server)
 )
 
 

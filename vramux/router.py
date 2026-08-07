@@ -12,25 +12,24 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
-import time
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 import aiohttp
 from aiohttp import web
 
+from . import env
 from .registry import ModelRegistry, ModelSpec
 from .supervisor import LlamaServerSupervisor
 
-log = logging.getLogger("vramux.llamacpp.router")
+log = logging.getLogger("vramux.router")
 
 
 # Longest gap tolerated between bytes from an upstream server. Generous enough
 # for a long prefill on a big context, short enough that a wedged backend
 # surfaces as an error instead of an unbounded hang.
-UPSTREAM_READ_TIMEOUT = float(os.environ.get("MYLLAMA_UPSTREAM_READ_TIMEOUT", "300"))
+UPSTREAM_READ_TIMEOUT = env.get_float("UPSTREAM_READ_TIMEOUT", 300.0)
 
 
 def _ts() -> str:
@@ -94,7 +93,7 @@ class Router:
         })
 
     async def version(self, _request: web.Request) -> web.Response:
-        return web.json_response({"version": "vramux-llamacpp-1"})
+        return web.json_response({"version": "vramux-1"})
 
     async def ps(self, _request: web.Request) -> web.Response:
         """Mimic ollama's `/api/ps` — what model (if any) is currently loaded."""

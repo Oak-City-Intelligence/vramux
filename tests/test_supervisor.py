@@ -11,8 +11,8 @@ from typing import List, Optional
 
 import pytest
 
-from llama_router.registry import KIND_DOCKER, ModelSpec
-from llama_router.supervisor import LlamaServerSupervisor
+from vramux.registry import KIND_DOCKER, ModelSpec
+from vramux.supervisor import LlamaServerSupervisor
 
 
 class FakeBackend:
@@ -237,7 +237,7 @@ async def test_per_model_idle_timeout_overrides_the_default(sup):
 async def test_reconcile_stops_orphaned_containers_only(monkeypatch):
     """A router restart while a container is loaded leaves it holding ~20 GB
     while the fresh supervisor believes the slot is free."""
-    from llama_router import supervisor as sup_mod
+    from vramux import supervisor as sup_mod
 
     stopped: List[str] = []
 
@@ -261,7 +261,7 @@ async def test_reconcile_stops_orphaned_containers_only(monkeypatch):
 
 
 async def test_reconcile_failure_does_not_block_startup(monkeypatch):
-    from llama_router import supervisor as sup_mod
+    from vramux import supervisor as sup_mod
 
     class ExplodingDocker:
         def __init__(self, spec):

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from llama_router.router import (
+from vramux.router import (
     _is_unload_request,
     _ollama_options_to_openai,
     _openai_chat_to_ollama,
