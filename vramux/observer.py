@@ -14,6 +14,9 @@ Two jobs:
 * **Measurement.** Sample around every managed load, and write the delta to a
   cache keyed by the configuration that determines footprint. A measurement is
   discarded rather than recorded when something else moved during the window.
+* **History.** Record what the card looked like on a timer, so foreign usage
+  over time is something that can be read back rather than something that
+  scrolled past in the journal.
 """
 
 from __future__ import annotations
@@ -42,12 +45,26 @@ CACHE_VERSION = 1
 FOREIGN_DRIFT_TOLERANCE_MB = 64
 
 
-def _cache_path() -> Path:
+# A history row is ~110 bytes, so this is a couple of megabytes at most and
+# roughly a month of five-minute samples. Bounded on purpose: an unbounded log
+# in a cache directory is a disk-filler waiting for a long-lived service.
+HISTORY_MAX_ROWS = 20000
+
+
+def _cache_dir() -> Path:
     override = env.get("CACHE_DIR")
     if override:
-        return Path(override).expanduser() / "costs.json"
+        return Path(override).expanduser()
     base = os.environ.get("XDG_CACHE_HOME") or "~/.cache"
-    return Path(base).expanduser() / "vramux" / "costs.json"
+    return Path(base).expanduser() / "vramux"
+
+
+def _cache_path() -> Path:
+    return _cache_dir() / "costs.json"
+
+
+def _history_path() -> Path:
+    return _cache_dir() / "usage.jsonl"
 
 
 def _now() -> str:
@@ -196,6 +213,76 @@ class CostCache:
             log.debug("could not write cost cache at %s: %s", self.path, exc)
 
 
+class UsageLog:
+    """What the card looked like, over time.
+
+    The cost cache answers "what does this model cost"; this answers "what was
+    the rest of the machine doing", which is the number a budget is wrong about
+    when it is wrong. Append-only JSON lines, trimmed to a bound rather than
+    rotated — one file, readable with `tail`, and incapable of filling a disk.
+    """
+
+    def __init__(self, path: Optional[Path] = None, max_rows: int = HISTORY_MAX_ROWS) -> None:
+        self.path = path or _history_path()
+        self.max_rows = max_rows
+        self._rows: Optional[int] = None
+
+    def record(self, snap: "Snapshot") -> None:
+        row = {
+            "t": _now(),
+            "used_mb": snap.device.used_mb,
+            "free_mb": snap.device.free_mb,
+            "recognised_mb": snap.recognised_mb,
+            "foreign_mb": snap.foreign_mb,
+            "unattributed_mb": snap.device.unattributed_mb,
+        }
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.open("a") as fh:
+                fh.write(json.dumps(row, sort_keys=True) + "\n")
+        except OSError as exc:
+            log.debug("could not write usage history at %s: %s", self.path, exc)
+            return
+        self._rows = (self._count_rows() if self._rows is None else self._rows) + 1
+        # Rewrite in one go when the file has drifted well past the bound,
+        # rather than on every append: trimming is the rare path.
+        if self._rows > self.max_rows * 1.25:
+            self._trim()
+
+    def rows(self, limit: Optional[int] = None) -> List[dict]:
+        try:
+            lines = self.path.read_text().splitlines()
+        except OSError:
+            return []
+        if limit is not None:
+            lines = lines[-limit:]
+        out = []
+        for line in lines:
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue  # a torn last line is not worth failing over
+        return out
+
+    def _count_rows(self) -> int:
+        try:
+            with self.path.open() as fh:
+                return sum(1 for _ in fh)
+        except OSError:
+            return 0
+
+    def _trim(self) -> None:
+        try:
+            with self.path.open() as fh:
+                kept = fh.readlines()[-self.max_rows:]
+            tmp = self.path.with_suffix(".jsonl.tmp")
+            tmp.write_text("".join(kept))
+            tmp.replace(self.path)
+            self._rows = len(kept)
+        except OSError as exc:
+            log.debug("could not trim usage history at %s: %s", self.path, exc)
+
+
 class Observer:
     """Read-only accounting for one device."""
 
@@ -204,9 +291,11 @@ class Observer:
         device_index: int = 0,
         cache: Optional[CostCache] = None,
         probe=nvml.aprobe,
+        history: Optional[UsageLog] = None,
     ) -> None:
         self.device_index = device_index
         self.cache = cache if cache is not None else CostCache()
+        self.history = history if history is not None else UsageLog()
         self._probe = probe
         # owner label -> pids vramux started for it
         self._owned: Dict[str, List[int]] = {}
@@ -239,6 +328,17 @@ class Observer:
         located = {a.owner for a in attributions if a.owner}
         unlocated = sorted(o for o in self._owned if o not in located)
         return Snapshot(device=device, attributions=attributions, unlocated_owners=unlocated)
+
+    async def sample(self) -> Optional[Snapshot]:
+        """Take a reading and store it. Called on the broker's timer.
+
+        Failing to record a sample is a missing data point, never an error
+        anybody hears about — the same rule the rest of this module runs under.
+        """
+        snap = await self._safe_snapshot()
+        if snap is not None:
+            self.history.record(snap)
+        return snap
 
     async def log_snapshot(self, note: str = "") -> Optional[Snapshot]:
         snap = await self.snapshot()

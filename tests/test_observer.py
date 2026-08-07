@@ -17,6 +17,8 @@ from vramux.observer import (
     FOREIGN_DRIFT_TOLERANCE_MB,
     CostCache,
     Observer,
+    Snapshot,
+    UsageLog,
     cost_key,
 )
 from vramux.registry import KIND_DOCKER, ModelSpec
@@ -319,3 +321,61 @@ async def test_a_broken_probe_cannot_break_a_load(tmp_path):
     async with obs.measuring(spec()):
         ran = True
     assert ran
+
+
+# ---- usage history --------------------------------------------------------
+
+
+def observer_with_history(tmp_path, probe, **kw):
+    return Observer(
+        probe=probe,
+        cache=CostCache(tmp_path / "costs.json"),
+        history=UsageLog(tmp_path / "usage.jsonl", **kw),
+    )
+
+
+async def test_a_sample_records_what_the_card_looked_like(tmp_path):
+    """Foreign usage was logged and never stored, so drift over time could not
+    be read back. The broker's timer calls this."""
+    obs = observer_with_history(
+        tmp_path,
+        fake_probe(device(used=7800, procs=[GpuProcess(200, 400, "compositor")])),
+    )
+    await obs.sample()
+    rows = obs.history.rows()
+    assert len(rows) == 1
+    assert rows[0]["used_mb"] == 7800
+    assert rows[0]["foreign_mb"] == 400
+    assert rows[0]["unattributed_mb"] == 7800 - 400
+    assert rows[0]["t"]
+
+
+async def test_samples_accumulate_and_stay_bounded(tmp_path):
+    """An unbounded log in a cache directory is a disk-filler waiting for a
+    long-lived service."""
+    obs = observer_with_history(tmp_path, fake_probe(device(used=1000)), max_rows=10)
+    for _ in range(30):
+        await obs.sample()
+    rows = obs.history.rows()
+    assert 10 <= len(rows) <= 13, "trimmed back to the bound, not on every write"
+
+
+async def test_a_sample_from_a_blind_probe_records_nothing(tmp_path):
+    async def blind(_index=0):
+        return None
+
+    obs = observer_with_history(tmp_path, blind)
+    assert await obs.sample() is None
+    assert obs.history.rows() == []
+
+
+def test_a_torn_history_line_does_not_poison_the_rest(tmp_path):
+    path = tmp_path / "usage.jsonl"
+    path.write_text('{"used_mb": 1}\n{"used_mb": 2\n{"used_mb": 3}\n')
+    assert [r["used_mb"] for r in UsageLog(path).rows()] == [1, 3]
+
+
+def test_an_unwritable_history_does_not_raise(tmp_path):
+    UsageLog(Path("/proc/cannot/write/usage.jsonl")).record(
+        Snapshot(device=device(used=1000))
+    )  # must not raise
