@@ -120,6 +120,15 @@ def _state(args: argparse.Namespace) -> int:
     return 0
 
 
+def _top(args: argparse.Namespace) -> int:
+    """Imported here rather than at module scope: `console` pulls in `curses`,
+    and the router — which is what this module exists to start — has no
+    business failing on a box without a terminal library."""
+    from . import console
+
+    return console.top(args)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="vramux", description="vramux router (ollama-API compatible)"
@@ -167,6 +176,14 @@ def main() -> None:
 
     sub.add_parser("leases", help="list the leases currently held")
 
+    p_top = sub.add_parser("top", help="live view of the card")
+    p_top.add_argument("--once", action="store_true",
+                       help="print one frame and exit — for pipes and logs")
+    p_top.add_argument("--width", type=int, default=100,
+                       help="columns to render at, with --once")
+    p_top.add_argument("--height", type=int, default=40,
+                       help="rows to render at, with --once")
+
     args = parser.parse_args()
 
     clients = {
@@ -175,6 +192,7 @@ def main() -> None:
         "free": cli.free,
         "evict": cli.evict,
         "leases": cli.leases,
+        "top": _top,
     }
     handler = clients.get(args.subcommand)
     if handler is not None:

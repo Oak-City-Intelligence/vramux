@@ -256,6 +256,7 @@ Also:
 
 ```bash
 vramux state                       # what is on the card and who owns it
+vramux top                         # the same, live, until you press q
 vramux free --mb 8000              # block until 8 GB is available, then exit
 vramux evict <tag>                 # drop a managed resident by hand
 ```
@@ -464,7 +465,14 @@ different implementation, so nothing is thrown away.
 
 ## 13. Open questions
 
-- Does `/gpu/state` need to be streamable for a live view, or is polling fine?
+- ~~Does `/gpu/state` need to be streamable for a live view, or is polling
+  fine?~~ **Answered.** It is streamable: `GET /gpu/events` pushes the same
+  body as server-sent events, on change, with a keepalive comment while the
+  card is still. Streaming won on cost rather than on latency — one reading of
+  the card serves every watcher, and nothing is read at all when nobody is
+  watching, where polling consoles multiply `nvidia-smi` calls by however many
+  are open. Ages and TTLs are absent from the payload on purpose: a
+  server-side counter ticks every second and would make every frame a change.
 - ~~PID attribution for container-resident leaseholders (§5.2) assumes NVML
   reports host PIDs for container processes.~~ **Answered.** Verified against a
   real container backend: `docker compose top` and NVML agree on host PIDs, and

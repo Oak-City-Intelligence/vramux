@@ -11,13 +11,18 @@ turn a request into (spec, upstream URL, payload) and stream the answer back.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
-from typing import Any, Dict, Optional
+import time
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
 import aiohttp
 from aiohttp import web
 
 from . import env
+from .observer import known_cost_mb
 from .lease import (
     DEFAULT_TTL,
     Broker,
@@ -49,6 +54,108 @@ log = logging.getLogger("vramux.router")
 # surfaces as an error instead of an unbounded hang.
 UPSTREAM_READ_TIMEOUT = env.get_float("UPSTREAM_READ_TIMEOUT", 300.0)
 
+# How often the state feed reads the card while somebody is watching. One
+# reading serves every subscriber, so this is a cost per *router*, not per
+# console. Nothing samples at all when nobody is subscribed.
+EVENT_INTERVAL = max(0.1, env.get_float("EVENT_INTERVAL", 1.0))
+
+# A comment line every this many seconds when nothing has changed, so a dead
+# socket surfaces as a write error instead of a console that looks alive and
+# is watching a card it lost sight of ten minutes ago.
+EVENT_KEEPALIVE = max(EVENT_INTERVAL, env.get_float("EVENT_KEEPALIVE", 15.0))
+
+
+ROUTER: "web.AppKey[Router]" = web.AppKey("router")
+
+
+class StateFeed:
+    """One sampler, many watchers.
+
+    The console streams rather than polls, and streaming is only worth the
+    extra endpoint if it costs less than the polling did. That means the card
+    is read once per tick no matter how many consoles are attached — a second
+    watcher must not double the number of `nvidia-smi` calls this box makes.
+    Nothing samples at all while nobody is subscribed, so an idle router is
+    exactly as quiet as it was before this existed.
+
+    Subscribers get a one-slot queue and the newest reading wins: a console
+    that stalled for ten seconds wants the state of the card now, not ten
+    stale frames of what it missed.
+    """
+
+    def __init__(self, build, interval: float = EVENT_INTERVAL) -> None:
+        self._build = build
+        self.interval = interval
+        self._subscribers: List[asyncio.Queue] = []
+        self._task: Optional[asyncio.Task] = None
+        self._last: Optional[dict] = None
+
+    @property
+    def watchers(self) -> int:
+        return len(self._subscribers)
+
+    def subscribe(self) -> asyncio.Queue:
+        queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+        self._subscribers.append(queue)
+        if self._task is None:
+            self._task = asyncio.create_task(self._run())
+        return queue
+
+    def unsubscribe(self, queue: asyncio.Queue) -> None:
+        if queue in self._subscribers:
+            self._subscribers.remove(queue)
+        if not self._subscribers and self._task is not None:
+            self._task.cancel()
+            self._task = None
+            # The next subscriber gets a fresh reading rather than whatever the
+            # card looked like when the last console quit.
+            self._last = None
+
+    async def close(self) -> None:
+        task, self._task = self._task, None
+        self._subscribers.clear()
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    async def sample_once(self) -> Optional[dict]:
+        """Build a payload and hand it to every watcher if it differs.
+
+        Returns what was published, or None when the reading was unchanged.
+        Split out from the loop so a test can drive one tick without a timer.
+        """
+        try:
+            payload = await self._build()
+        except Exception as exc:  # a feed that dies takes every console with it
+            log.debug("state feed sample failed: %s", exc)
+            payload = {"error": str(exc)}
+        if payload is None:
+            payload = {"error": "no GPU visible"}
+        if payload == self._last:
+            return None
+        self._last = payload
+        for queue in list(self._subscribers):
+            # Drop what the watcher has not read yet: only the newest state is
+            # worth delivering, and a slow reader must not stall the sampler.
+            if queue.full():
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            try:
+                queue.put_nowait(payload)
+            except asyncio.QueueFull:
+                pass
+        return payload
+
+    async def _run(self) -> None:
+        while True:
+            await self.sample_once()
+            await asyncio.sleep(self.interval)
+
 
 class Router:
     def __init__(
@@ -61,6 +168,7 @@ class Router:
         self.arbiter = arbiter
         self.broker = broker
         self._client_session: Optional[aiohttp.ClientSession] = None
+        self.feed = StateFeed(self.state_payload)
 
     async def startup(self, _app: web.Application) -> None:
         # No total timeout — a long generation is legitimate — but a read
@@ -75,6 +183,7 @@ class Router:
             self.broker.start()
 
     async def cleanup(self, _app: web.Application) -> None:
+        await self.feed.close()
         if self._client_session:
             await self._client_session.close()
         if self.broker is not None:
@@ -142,18 +251,82 @@ class Router:
         observer that knows which PIDs vramux started lives in this process.
         A CLI asking from outside would see every process as foreign.
         """
+        if self.arbiter.observer is None:
+            return web.json_response({"error": "observation disabled"}, status=503)
+        payload = await self.state_payload()
+        if payload is None:
+            return web.json_response({"error": "no GPU visible"}, status=503)
+        return web.json_response(payload)
+
+    async def gpu_events(self, request: web.Request) -> web.StreamResponse:
+        """The same state, pushed, for `vramux top`.
+
+        Server-sent events rather than a websocket: this is one-way, and a
+        console that can be read with `curl` is a console that can be debugged
+        without writing a client first. Every watcher shares one sampler — see
+        `StateFeed` — so the second console costs a socket, not a second read
+        of the card.
+        """
+        if self.arbiter.observer is None:
+            return web.json_response({"error": "observation disabled"}, status=503)
+        resp = web.StreamResponse(
+            status=200,
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                # Nothing sits in front of this today, but an SSE stream through
+                # a buffering proxy arrives in one lump at the end, which reads
+                # as a hung console rather than as a proxy problem.
+                "X-Accel-Buffering": "no",
+            },
+        )
+        await resp.prepare(request)
+        queue = self.feed.subscribe()
+        try:
+            # The first frame is the current state, not the next *change*: a
+            # console that attaches to an idle card must draw something.
+            first = await self.state_payload()
+            await _sse_write(resp, first if first is not None else {"error": "no GPU visible"})
+            last_write = time.monotonic()
+            while True:
+                try:
+                    payload = await asyncio.wait_for(
+                        queue.get(), timeout=EVENT_KEEPALIVE
+                    )
+                except asyncio.TimeoutError:
+                    payload = None
+                if payload is None:
+                    if time.monotonic() - last_write >= EVENT_KEEPALIVE:
+                        await resp.write(b": keepalive\n\n")
+                        last_write = time.monotonic()
+                    continue
+                await _sse_write(resp, payload)
+                last_write = time.monotonic()
+        except (ConnectionResetError, asyncio.CancelledError):
+            # A console quitting is the normal end of this handler, not a fault.
+            pass
+        finally:
+            self.feed.unsubscribe(queue)
+        return resp
+
+    async def state_payload(self) -> Optional[dict]:
+        """The `/gpu/state` body, or None when the card cannot be read.
+
+        One builder for both the poll and the stream. Two would drift, and the
+        one that drifted would be the one the console draws from.
+        """
         observer = self.arbiter.observer
         if observer is None:
-            return web.json_response({"error": "observation disabled"}, status=503)
+            return None
         snap = await observer.snapshot()
         if snap is None:
-            return web.json_response({"error": "no GPU visible"}, status=503)
+            return None
         leases = []
         budget = None
         if self.broker is not None:
             leases = await self.broker.views(snap)
             budget = (await self.broker.budget(snap)).to_json()
-        return web.json_response({
+        return {
             "device": {
                 "index": snap.device.index,
                 "name": snap.device.name,
@@ -171,6 +344,10 @@ class Router:
             ],
             "unlocated_owners": snap.unlocated_owners,
             "residents": [r.tag for r in self.arbiter.residents],
+            # The same residents with what the console needs to draw a row.
+            # Additive: `residents` stays a list of tags because clients on
+            # this machine already read it that way.
+            "resident_detail": _resident_detail(self.arbiter, observer.cache),
             # A load in progress, so a slow cold container reads as a wait
             # rather than as a card that has stopped answering.
             "loading": self.arbiter.loading,
@@ -180,7 +357,7 @@ class Router:
             # lease — nothing requires a grant to serve a model yet.
             "leases": leases,
             "budget": budget,
-        })
+        }
 
     # ---- leases ---------------------------------------------------------------
 
@@ -482,6 +659,41 @@ class Router:
         return resp
 
 
+async def _sse_write(resp: web.StreamResponse, payload: dict) -> None:
+    """One server-sent event. Named, so a browser can `addEventListener`."""
+    await resp.write(b"event: state\ndata: " + json.dumps(payload).encode() + b"\n\n")
+
+
+def _resident_detail(arbiter, cache) -> List[dict]:
+    """Each resident as the console draws it.
+
+    `last_use` is an absolute timestamp rather than an idle counter on purpose:
+    an age recomputed here would tick every second, and a payload that never
+    repeats turns "publish only when the state changed" into "publish always".
+    The console subtracts it from its own clock — the same clock, since a
+    consumer of this endpoint is on the machine the card is in.
+    """
+    now_mono = time.monotonic()
+    now_wall = time.time()
+    rows = []
+    for resident in sorted(arbiter.residents, key=lambda r: -r.last_use):
+        rows.append({
+            "tag": resident.tag,
+            "port": resident.port,
+            "inflight": resident.inflight,
+            "last_use": (
+                datetime.fromtimestamp(
+                    now_wall - (now_mono - resident.last_use), timezone.utc
+                ).isoformat(timespec="seconds")
+                if resident.last_use else None
+            ),
+            # What it is believed to cost — measured or declared. None means
+            # nothing knows, which is also why it is being served alone.
+            "cost_mb": known_cost_mb(cache, resident.spec),
+        })
+    return rows
+
+
 def _still_loading(exc: BackendLoading) -> web.Response:
     """503 with a reason, instead of a socket that never answers.
 
@@ -517,6 +729,9 @@ def make_app(
 ) -> web.Application:
     app = web.Application(client_max_size=64 * 1024 * 1024)
     r = Router(registry, arbiter, broker)
+    # Reachable from the app so a test can look at the state feed's watchers
+    # without going through a socket to ask.
+    app[ROUTER] = r
     app.on_startup.append(r.startup)
     app.on_cleanup.append(r.cleanup)
     app.router.add_get("/", r.health)
@@ -524,6 +739,7 @@ def make_app(
     app.router.add_get("/api/tags", r.list_tags)
     app.router.add_get("/api/ps", r.ps)
     app.router.add_get("/gpu/state", r.gpu_state)
+    app.router.add_get("/gpu/events", r.gpu_events)
     app.router.add_get("/gpu/lease", r.lease_list)
     app.router.add_post("/gpu/lease", r.lease_acquire)
     app.router.add_delete("/gpu/lease/{lease_id}", r.lease_release)

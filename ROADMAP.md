@@ -496,6 +496,48 @@ is foreign, what is queued and waiting. The thing that was wanted at the start.
 
 The existing tools stay exactly as they are. They gain a floor, not a rewrite.
 
+### What landed, 2026-08-07
+
+**A terminal console, streamed.** `vramux top` draws the card from
+`/gpu/events`, a server-sent event stream carrying the same body `/gpu/state`
+returns. Both open questions in this file are answered by it:
+
+- **Streaming, not polling** — and the reason it is worth an endpoint is that
+  it costs *less* than polling did. Every watcher shares one reading, so a
+  second console is a socket rather than a second `nvidia-smi`, and nothing
+  samples at all while nobody is attached. A console that cannot stream falls
+  back to polling `/gpu/state` and says so on screen, which is also what
+  happens against a router older than this file.
+- **A TUI, not a web view** — stdlib `curses`, no dependency, works over the
+  SSH connection you open when the box is in trouble. A page can come later
+  and would read the same endpoint.
+
+Frames go out **on change**, which is why the payload carries absolute
+timestamps and no ages: an idle counter computed server-side ticks every
+second and would turn "publish when the card moved" into a per-second
+broadcast of nothing. Ages and TTLs are worked out by the console against its
+own clock — the same machine's clock, since a consumer of this endpoint is on
+the card's box. A card doing nothing sends one frame and then a comment line
+every fifteen seconds, so a dead socket surfaces as a write error rather than
+as a console quietly watching a router it lost.
+
+`/gpu/state` grew `resident_detail` alongside the `residents` tag list it has
+always had — port, in-flight requests, last use, and what the model is
+believed to cost. Additive on purpose: clients on this machine already read
+`residents` as a list of tags.
+
+Two things the live run corrected, neither of them arithmetic:
+
+- A leaseholder's process was being drawn under FOREIGN while its memory was
+  already on screen as HELD. Same 2 386 MiB, twice, which reads as two
+  allocations — the exact confusion one accounting exists to prevent.
+- HELD above the grant is normal and stays unmarked: 2 000 MiB requested is
+  2 386 MiB on the card, the CUDA context being the difference. What is worth
+  marking is OUT — a grant nobody has allocated against.
+
+Rendering is a pure function from state to lines, so every layout decision is
+tested without a terminal, a card, or a router. 30 tests came with it.
+
 ---
 
 ## Working around a busy GPU
@@ -542,6 +584,4 @@ subject.
 ## Open
 
 - Multi-GPU placement policy (device index threaded through, nothing designed)
-- Whether `/gpu/state` needs streaming or polling suffices
 - Priority granularity: per-consumer, or just interactive versus batch
-- Whether Stage 7 is a TUI or a web view

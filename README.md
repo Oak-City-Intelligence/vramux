@@ -50,6 +50,7 @@ not defended.
 - a wedged backend (process up, `/health` red) is recycled rather than reused
 - a container left running by a previous process is stopped at startup
 - `GET /gpu/state` — what is resident, what is foreign, what each model cost
+- `GET /gpu/events` — the same state as server-sent events, pushed on change
 - `POST /gpu/lease`, `DELETE /gpu/lease/{id}`, `POST /gpu/lease/{id}/renew` —
   memory reserved for consumers vramux does not run
 - `POST /gpu/evict` — unload a named resident by hand
@@ -105,6 +106,8 @@ documents both backend kinds.
 | `VRAMUX_RESERVE_MB` | `1024` | headroom held back from every lease |
 | `VRAMUX_MAX_RESIDENTS` | `2` | ceiling on models resident at once; the budget is the real limit |
 | `VRAMUX_SAMPLE_INTERVAL` | `300` | seconds between usage-history samples; clamped up to the 5 s lease sweep it rides on |
+| `VRAMUX_EVENT_INTERVAL` | `1` | seconds between readings while a console is watching; nothing is read when none is |
+| `VRAMUX_EVENT_KEEPALIVE` | `15` | seconds of an unchanged card before the event stream sends a comment line |
 
 The older `MYLLAMA_*` names still work, warning once each.
 
@@ -144,13 +147,50 @@ keyed by the configuration that determines footprint — context length included
 since the same weights at 16K and 128K differ by gigabytes. A measurement is
 discarded rather than recorded when foreign usage moves during the load.
 
-Nothing reads those numbers to make a decision yet. That is deliberate: the
-cost model is the largest OOM risk in the design, and it should be answering
-from real measurements before anything depends on it.
+Admission reads those numbers, and only those: a model is packed beside another
+when a measured or declared cost fits in what is free. There is deliberately no
+estimate, because the cost model is the largest OOM risk in the design and an
+underestimate takes the innocent resident down with the new one.
 
 What the card looked like is also sampled on a timer into
 `~/.cache/vramux/usage.jsonl`, bounded and appended one JSON object per line,
 so foreign usage over time can be read back rather than scrolled past.
+
+### Watching it live
+
+```bash
+vramux top
+```
+
+```
+vramux  NVIDIA GeForce RTX 4090  (gpu0)   streaming
+[#######################################::::                              ]
+ 9 807 / 24 564 MiB used (39%)   grantable 13 733   reserve 1 024   foreign 2 796
+
+ RESIDENT                         COST   PORT  REQ   IDLE
+ qwen3.5:9b-4k                   6 195  18080    0     1m
+
+ LEASE OWNER                     GRANT     HELD     OUT   TTL
+ batch-pipeline                  2 000    2 386       0   53s
+
+ FOREIGN                           MiB   PID
+ compositor                        240   2185
+ browser                           170   283219
+```
+
+`q` quits. The bar draws the reserve as `:` — neither yours nor free.
+**HELD** is what a leaseholder has on the card right now and **OUT** is the
+grant it has not allocated against yet; a holder that has just taken a lease
+is all OUT, and one still showing OUT an hour later is worth a look. HELD
+above the grant is normal: a CUDA context costs a few hundred MiB that nobody
+asks for, which is what the reserve is there to cover.
+
+The console streams `/gpu/events` and falls back to polling `/gpu/state` when
+it cannot — the header says which. Every watcher shares one reading of the
+card, so a second console costs a socket and not a second `nvidia-smi`, and
+nothing is sampled at all while nobody is watching.
+
+`vramux top --once` prints a single frame and exits, for logs and pipes.
 
 ## Leases
 
@@ -205,6 +245,7 @@ vramux/
   budget.py       how much there is to hand out — pure arithmetic
   lease.py        the broker: grants, expiry, reclaim by process tree
   cli.py          the client side — `lease`, `free`, `evict`, stdlib only
+  console.py      `vramux top` — a pure renderer and an SSE reader, stdlib only
   registry.py     ModelSpec, YAML config, dir scan, ollama-blob discovery
   backends.py     the Backend contract: ProcessBackend + DockerComposeBackend
   residency.py    who is on the card: admission, eviction, drain, idle
