@@ -1,13 +1,20 @@
-"""Model registry: ollama tag → GGUF blob path + serving params.
+"""Model registry: tag → weights + serving parameters.
 
-Loaded from the models config in the console-dir config dir, with a
-fallback hard-coded mapping that covers the models present in
-/usr/share/ollama/.ollama/models when this module was written.
+Specs come from three sources, each overriding the one before it:
+
+1. an ollama blob store, if one exists on this machine
+2. a scan of the configured GGUF directory
+3. the YAML config file, which is the only place that can describe a
+   ``docker``-kind model and the only place that sets per-model context sizes
+
+Nothing here has a default that points at one particular machine: paths come
+from the environment or from locations checked for existence first.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,14 +25,49 @@ import yaml
 from . import env
 
 
-OLLAMA_MODELS_ROOT = Path("/usr/share/ollama/.ollama/models")
+DEFAULT_CTX_SIZE = 8192
+
+# Where ollama keeps its blob store, in the order ollama itself looks. Only a
+# location that actually exists is used; on a machine that never had ollama
+# installed, discovery simply finds nothing.
+_OLLAMA_ROOT_CANDIDATES = (
+    "/usr/share/ollama/.ollama/models",
+    "~/.ollama/models",
+)
+
+
+def _resolve_ollama_root() -> Path:
+    override = env.get("OLLAMA_MODELS") or os.environ.get("OLLAMA_MODELS")
+    candidates = [override] if override else list(_OLLAMA_ROOT_CANDIDATES)
+    for cand in candidates:
+        path = Path(cand).expanduser()
+        if path.is_dir():
+            return path
+    # Nothing installed. Return the first candidate anyway so the module-level
+    # roots are well-defined Paths; `is_dir()` guards every use of them.
+    return Path(candidates[0]).expanduser()
+
+
+OLLAMA_MODELS_ROOT = _resolve_ollama_root()
 MANIFESTS_ROOT = OLLAMA_MODELS_ROOT / "manifests" / "registry.ollama.ai" / "library"
 BLOBS_ROOT = OLLAMA_MODELS_ROOT / "blobs"
 
-DEFAULT_MODEL_DIR = Path(env.get("MODEL_DIR", "<model-dir>"))
-DEFAULT_CONFIG_FILE = Path(
-    env.get("MODELS_CONFIG", str(Path(__file__).resolve().parent.parent / "models.yml"))
-)
+
+def _default_model_dir() -> Path:
+    """GGUF directory: configured, else `./models` under the working directory."""
+    return Path(env.get("MODEL_DIR", "models")).expanduser()
+
+
+def _default_config_file() -> Path:
+    """Config file: configured, else `models.yml` in the working directory,
+    else one sitting next to the package (how a git checkout is laid out)."""
+    override = env.get("MODELS_CONFIG")
+    if override:
+        return Path(override).expanduser()
+    local = Path.cwd() / "models.yml"
+    if local.is_file():
+        return local
+    return Path(__file__).resolve().parent.parent / "models.yml"
 
 
 KIND_LLAMA_SERVER = "llama-server"
@@ -50,7 +92,7 @@ class ModelSpec:
 
     tag: str                     # ollama-style "name:variant", e.g. "qwen3.5:27b"
     gguf_path: Optional[Path] = None   # llama-server kind: path to the .gguf / ollama blob
-    ctx_size: int = 8192         # context window in tokens
+    ctx_size: int = DEFAULT_CTX_SIZE   # context window in tokens
     # None = let llama-server auto-fit layers (`common_fit_params`). Use an
     # explicit int (e.g. 999) only when you want to force-offload regardless
     # of free VRAM — that path bypasses auto-fit and OOMs on large models.
@@ -136,29 +178,15 @@ def _resolve_ollama_blob(name: str, variant: str) -> Optional[Path]:
 
 
 def _default_specs() -> Dict[str, ModelSpec]:
-    """Discover every model under the ollama blob store."""
+    """Discover every model under the ollama blob store.
+
+    Discovered models get `DEFAULT_CTX_SIZE`; a manifest says nothing about
+    what context window is affordable on the card in front of it. Per-tag
+    sizes belong in the config file's `ctx_overrides` block.
+    """
     specs: Dict[str, ModelSpec] = {}
     if not MANIFESTS_ROOT.is_dir():
         return specs
-
-    # Per-tag context-size overrides (ollama variant naming convention)
-    ctx_overrides: Dict[str, int] = {
-        "qwen3.5:9b-96k": 98304,
-        "qwen3.5:9b-64k": 65536,
-        "qwen3.5:9b": 16384,
-        "qwen3.5:27b": 16384,
-        "qwen3.6:27b": 16384,
-        "qwen3.6:27b-q4_k_m": 16384,
-        "gpt-oss:20b": 16384,
-        "command-r:35b": 16384,
-        "phi4:14b": 16384,
-        "qwen2.5-coder:7b": 16384,
-        "llama3.1:8b": 16384,
-        "gemma3:latest": 8192,
-        "glm-4.7-flash:latest": 16384,
-        "a client-agent:latest": 16384,
-        "nomic-embed-text:latest": 8192,
-    }
 
     for name_dir in sorted(MANIFESTS_ROOT.iterdir()):
         if not name_dir.is_dir():
@@ -175,7 +203,7 @@ def _default_specs() -> Dict[str, ModelSpec]:
             specs[tag] = ModelSpec(
                 tag=tag,
                 gguf_path=blob,
-                ctx_size=ctx_overrides.get(tag, 8192),
+                ctx_size=DEFAULT_CTX_SIZE,
                 is_embedding=name.startswith("nomic-embed"),
                 family=name,
             )
@@ -210,7 +238,7 @@ def _scan_model_dir(root: Path) -> Dict[str, ModelSpec]:
         specs[tag] = ModelSpec(
             tag=tag,
             gguf_path=gguf,
-            ctx_size=8192,
+            ctx_size=DEFAULT_CTX_SIZE,
             family=tag.split(":")[0],
             is_embedding="embed" in gguf.stem.lower(),
         )
@@ -226,21 +254,31 @@ class ModelRegistry:
         config_file: Optional[Path] = None,
         model_dir: Optional[Path] = None,
     ) -> None:
-        self.config_file = config_file or DEFAULT_CONFIG_FILE
-        self.model_dir = model_dir or DEFAULT_MODEL_DIR
+        self.config_file = config_file or _default_config_file()
+        self.model_dir = model_dir or _default_model_dir()
         self._specs: Dict[str, ModelSpec] = {}
         self.reload()
 
     def reload(self) -> None:
-        # Precedence (later overrides earlier): ollama blobs < /mnt dir scan < YAML.
+        # Precedence (later overrides earlier): ollama blobs < model-dir scan < YAML.
         specs = _default_specs()
         specs.update(_scan_model_dir(self.model_dir))
+        data: Dict = {}
         yaml_gguf_paths: set = set()
         if self.config_file.is_file():
             try:
                 data = yaml.safe_load(self.config_file.read_text()) or {}
             except (OSError, yaml.YAMLError):
                 data = {}
+            if not isinstance(data, dict):
+                data = {}
+            # Context sizes for *discovered* models. A manifest or a filename
+            # cannot say what window the local card can afford, so that
+            # judgement lives in config rather than in this module.
+            for tag, ctx in (data.get("ctx_overrides") or {}).items():
+                spec = specs.get(tag)
+                if spec is not None:
+                    spec.ctx_size = int(ctx)
             for tag, entry in (data.get("models") or {}).items():
                 kind = entry.get("kind", KIND_LLAMA_SERVER)
                 if kind == KIND_DOCKER:
@@ -248,10 +286,10 @@ class ModelRegistry:
                         tag=tag,
                         kind=KIND_DOCKER,
                         compose_file=Path(entry["compose_file"]).expanduser(),
-                        compose_service=entry.get("compose_service", "container-model"),
+                        compose_service=entry.get("compose_service"),
                         port=int(entry["port"]),
                         served_name_override=entry.get("served_name"),
-                        ctx_size=int(entry.get("ctx", 8192)),
+                        ctx_size=int(entry.get("ctx", DEFAULT_CTX_SIZE)),
                         idle_timeout=(float(entry["idle_timeout"]) if entry.get("idle_timeout") is not None else None),
                         weights_dir=(Path(entry["weights_dir"]).expanduser() if entry.get("weights_dir") else None),
                         quantization=entry.get("quantization", "unknown"),
@@ -263,7 +301,7 @@ class ModelRegistry:
                 specs[tag] = ModelSpec(
                     tag=tag,
                     gguf_path=gguf,
-                    ctx_size=int(entry.get("ctx", 8192)),
+                    ctx_size=int(entry.get("ctx", DEFAULT_CTX_SIZE)),
                     n_gpu_layers=(int(entry["n_gpu_layers"]) if entry.get("n_gpu_layers") is not None else None),
                     extra_args=list(entry.get("extra_args", [])),
                     is_embedding=bool(entry.get("embedding", False)),

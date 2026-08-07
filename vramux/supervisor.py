@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
 import signal
 import time
 from pathlib import Path
@@ -32,9 +33,19 @@ from .registry import KIND_DOCKER, ModelSpec
 log = logging.getLogger("vramux.supervisor")
 
 
-LLAMA_SERVER_BIN = Path(
-    env.get("LLAMA_SERVER_BIN", "<llama.cpp-build>/llama-server)
-)
+def resolve_llama_server_bin() -> Optional[Path]:
+    """Locate the llama.cpp server binary.
+
+    An explicit `VRAMUX_LLAMA_SERVER_BIN` wins — a build tree is the common
+    case and is rarely on `$PATH`. Otherwise take whatever `$PATH` offers.
+    Resolved per start rather than at import so the answer follows the
+    environment the process is actually running in.
+    """
+    override = env.get("LLAMA_SERVER_BIN")
+    if override:
+        return Path(override).expanduser()
+    found = shutil.which("llama-server")
+    return Path(found) if found else None
 
 
 async def _wait_for_health(
@@ -80,13 +91,19 @@ class ProcessBackend:
         return self._proc is not None and self._proc.returncode is None
 
     async def start(self, spec: ModelSpec, startup_timeout: float) -> None:
-        if not LLAMA_SERVER_BIN.is_file():
-            raise RuntimeError(f"llama-server binary not found at {LLAMA_SERVER_BIN}")
+        binary = resolve_llama_server_bin()
+        if binary is None:
+            raise RuntimeError(
+                "llama-server not found on $PATH — set VRAMUX_LLAMA_SERVER_BIN "
+                "to the binary in your llama.cpp build"
+            )
+        if not binary.is_file():
+            raise RuntimeError(f"llama-server binary not found at {binary}")
         if spec.gguf_path is None or not spec.gguf_path.is_file():
             raise RuntimeError(f"GGUF not found for {spec.tag}: {spec.gguf_path}")
 
         args = [
-            str(LLAMA_SERVER_BIN),
+            str(binary),
             "-m", str(spec.gguf_path),
             "--host", self.host,
             "--port", str(self.port),
@@ -161,8 +178,10 @@ class DockerComposeBackend:
     """
 
     def __init__(self, spec: ModelSpec) -> None:
-        if spec.port is None or spec.compose_file is None:
-            raise RuntimeError(f"docker spec {spec.tag} needs compose_file and port")
+        if spec.port is None or spec.compose_file is None or not spec.compose_service:
+            raise RuntimeError(
+                f"docker spec {spec.tag} needs compose_file, compose_service and port"
+            )
         self.spec = spec
         self.upstream = f"http://127.0.0.1:{spec.port}"
         self._started = False
@@ -192,7 +211,7 @@ class DockerComposeBackend:
         return proc.returncode, (out or b"").decode(errors="replace").strip()
 
     async def start(self, spec: ModelSpec, startup_timeout: float) -> None:
-        service = spec.compose_service or "container-model"
+        service = spec.compose_service
         log.info("starting container %s for %s (ctx=%d)", service, spec.tag, spec.ctx_size)
         rc, out = await self._run("up", "-d", service)
         if rc != 0:
@@ -233,7 +252,7 @@ class DockerComposeBackend:
     async def stop(self) -> None:
         if not self._started:
             return
-        service = self.spec.compose_service or "container-model"
+        service = self.spec.compose_service
         # `stop`, not `down`: keeps the container (and its warm caches) around
         # so the next load is a restart rather than a recreate.
         rc, out = await self._run("stop", service, timeout=90)

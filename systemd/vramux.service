@@ -1,0 +1,46 @@
+# vramux user unit. Install with:
+#
+#   mkdir -p ~/.config/systemd/user
+#   sed "s|%CHECKOUT%|$PWD|" systemd/vramux.service > ~/.config/systemd/user/vramux.service
+#   systemctl --user daemon-reload && systemctl --user enable --now vramux
+#
+# A user unit, not a system one: vramux runs as you, uses your GPU, and (for
+# the docker backend) your docker group membership.
+
+[Unit]
+Description=vramux — ollama-compatible multi-runtime model router
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%CHECKOUT%
+Environment=PYTHONUNBUFFERED=1
+
+# Only needed when llama-server is not on $PATH — a llama.cpp build tree
+# usually is not.
+#Environment=VRAMUX_LLAMA_SERVER_BIN=%h/src/llama.cpp/build/bin/llama-server
+
+# Loopback only. vramux has NO authentication: anything that can reach this
+# port can load models and run inference. See SECURITY.md before changing it.
+Environment=VRAMUX_HOST=127.0.0.1
+Environment=VRAMUX_PORT=11434
+
+# Where llama-server backends are asked to listen. Internal; not for clients.
+Environment=VRAMUX_UPSTREAM_PORT=18080
+
+# Seconds a model stays resident with no requests. Matches ollama's default.
+Environment=VRAMUX_IDLE_TIMEOUT=900
+
+# GGUF directory to scan. Defaults to ./models under WorkingDirectory.
+#Environment=VRAMUX_MODEL_DIR=%h/models/gguf
+
+ExecStart=/usr/bin/python3 -m vramux
+Restart=on-failure
+RestartSec=3
+# The router's children are process groups (llama-server); mixed lets it
+# signal the main process and clean up the rest.
+KillMode=mixed
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

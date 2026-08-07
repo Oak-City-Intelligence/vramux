@@ -1,0 +1,89 @@
+# vramux model registry — copy to `models.yml` and edit.
+#
+# vramux finds models from three places, each overriding the one before it:
+#
+#   1. an ollama blob store, if this machine has one
+#   2. a scan of the GGUF directory (VRAMUX_MODEL_DIR, default ./models)
+#   3. this file
+#
+# You only need entries here for models that want serving parameters the first
+# two sources cannot express — which is most models worth running.
+#
+# SECURITY: this file is a trust boundary. A `docker` entry causes vramux to
+# run `docker compose` with the compose file you name here, so whoever can
+# write this file can start containers as you. See SECURITY.md.
+
+
+# Context sizes for models found by discovery rather than listed below. A
+# manifest or a filename says nothing about what window the card in this
+# machine can afford, so that judgement belongs here.
+ctx_overrides:
+  qwen2.5-coder:7b: 16384
+  llama3.1:8b: 16384
+  nomic-embed-text:latest: 8192
+
+
+models:
+
+  # --- kind: llama-server (the default) -----------------------------------
+  # A local GGUF. vramux spawns llama-server on it and stops it on swap or
+  # idle. `gguf` is the only required key; `~` is expanded.
+
+  qwen3.5:9b:
+    gguf: ~/models/gguf/Qwen_Qwen3.5-9B-Q4_K_M.gguf
+    ctx: 16384
+    family: qwen3.5
+
+  # The same weights at a bigger window is a separate model as far as the GPU
+  # is concerned, so it gets its own tag. Requesting one evicts the other.
+  qwen3.5:9b-96k:
+    gguf: ~/models/gguf/Qwen_Qwen3.5-9B-Q4_K_M.gguf
+    ctx: 98304
+    family: qwen3.5
+
+  # `extra_args` is passed through to llama-server verbatim. Flash attention
+  # plus a q8_0 KV cache roughly halves KV memory at a long context, which is
+  # usually what stands between a big window and an OOM.
+  #
+  # `n_gpu_layers` is deliberately absent: with no -ngl, llama-server auto-fits
+  # the largest layer count that fits in free VRAM. Setting it explicitly
+  # bypasses that and will OOM on a large model.
+  some-27b-model:27b:
+    gguf: ~/models/gguf/Some-Model-27B-Q4_K.gguf
+    ctx: 65536
+    family: some-model
+    extra_args: ["-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0"]
+
+  an-embedding-model:latest:
+    gguf: ~/models/gguf/nomic-embed-text-v1.5.gguf
+    ctx: 8192
+    embedding: true
+
+  # --- kind: docker -------------------------------------------------------
+  # For a model llama.cpp cannot load at all: it ships its own
+  # OpenAI-compatible server in a container, and vramux brings that container
+  # up and down exactly as it starts and stops a llama-server, so it competes
+  # for the same GPU under the same rules.
+  #
+  # The contract the container must satisfy:
+  #   - serves an OpenAI-compatible API on `port`
+  #   - answers GET /health with 200 when it is ready
+  #   - answers to the model id in `served_name`
+  #   - sets no `restart:` policy in its compose file — that would fight
+  #     vramux for the GPU and re-pin the card after a reboot
+  #
+  # See examples/docker-backend/ for a complete worked one.
+
+  a-container-model:35b:
+    kind: docker
+    compose_file: ~/containers/some-model/docker-compose.yml
+    compose_service: some-model      # the service name inside that file
+    port: 30000                      # host port it publishes
+    served_name: vendor/some-model-w2  # the id the container answers to
+    ctx: 131072
+    # A container reload costs far more than a GGUF load, so evicting it on the
+    # default schedule is a bad trade.
+    idle_timeout: 3600
+    weights_dir: ~/models/some-model   # size reporting only
+    quantization: W2
+    family: some-model
