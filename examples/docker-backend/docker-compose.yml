@@ -1,0 +1,89 @@
+# A worked `docker` backend for vramux.
+#
+# vramux brings this service up when the model is requested and stops it when
+# something else needs the card, exactly as it starts and stops a llama-server.
+# Everything below that is not ordinary compose is called out in the comments;
+# the four things vramux actually requires are in README.md.
+#
+# vLLM is used here because it is a real OpenAI-compatible server anyone can
+# pull. Any image satisfying the contract works the same way.
+
+services:
+  example-model:
+    image: vllm/vllm-openai:latest
+    container_name: vramux-example-model
+
+    # NO `restart:` POLICY. This is a hard requirement, not a preference: a
+    # restart policy makes docker bring the container back after vramux has
+    # deliberately stopped it, and re-pins the whole card after a reboot with
+    # nothing left to explain why the GPU is full.
+
+    ports:
+      # host:container. The host side is what goes in `port:` in models.yml.
+      # Pick something clear of vramux (11434) and of the llama-server upstream
+      # port (18080).
+      - "30000:8000"
+
+    volumes:
+      # Weights, read-only. vramux never reads this path except to report a
+      # size; the container is what needs it.
+      - ${EXAMPLE_MODEL_DIR:-~/models/example-model}:/models/example-model:ro
+      # The compiler and kernel caches. Worth persisting: vramux unloads with
+      # `docker compose stop` rather than `down` precisely so warm caches
+      # survive, and this is where the expensive half of them lives.
+      - example-model-cache:/root/.cache
+
+    environment:
+      - HUGGING_FACE_HUB_OFFLINE=1
+      # Not a secret and not a credential: vLLM reads it for cache layout only.
+      - HF_HOME=/root/.cache/huggingface
+
+    command:
+      - --model=/models/example-model
+      # The id the server answers to. This must equal `served_name` in
+      # models.yml — vramux rewrites the client's model tag to it on the way
+      # through, and a mismatch is a 404 from the container that looks like a
+      # vramux bug.
+      - --served-model-name=vendor/example-model
+      - --host=0.0.0.0
+      - --port=8000
+      # Context window. Keep it equal to `ctx:` in models.yml: vramux keys the
+      # measured cost of this model on the context it believes it is running,
+      # and the same weights at 16K and 128K differ by gigabytes.
+      - --max-model-len=131072
+      # How much of the card this server may take. It is a fraction of *total*
+      # VRAM, not of free VRAM, and the container will happily claim it out
+      # from under a resident vramux did not stop first. Leave headroom.
+      - --gpu-memory-utilization=0.85
+
+    healthcheck:
+      # vramux polls GET /health over HTTP itself and does not read docker's
+      # health status, so this block is for `docker ps` rather than for the
+      # router. The endpoint it polls is the one below.
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 30
+      start_period: 120s
+
+    # Loopback publishing is the compose half of vramux's own posture: the
+    # container has no authentication either. See SECURITY.md.
+    # ports above become "127.0.0.1:30000:8000" on a machine with any other
+    # network interface you do not fully trust.
+
+    ipc: host          # vLLM wants it for its shared-memory workers
+    shm_size: "8gb"
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              # Pin the same device vramux observes (VRAMUX_DEVICE, default 0).
+              # Handing the container a different GPU than the one being
+              # accounted is the quietest way to make the budget a lie.
+              device_ids: ["0"]
+              capabilities: [gpu]
+
+volumes:
+  example-model-cache:

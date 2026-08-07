@@ -34,6 +34,9 @@ things to know before running it:
 - **The docker backend needs membership in the `docker` group**, which is
   root-equivalent on most systems.
 
+`SECURITY.md` states the threat model in full, including what is deliberately
+not defended.
+
 ## What it implements
 
 - `/api/tags`, `/api/show`, `/api/chat`, `/api/generate`, `/api/embeddings`,
@@ -61,7 +64,16 @@ cp models.example.yml models.yml   # then edit it
 python3 -m vramux
 ```
 
-As a user service:
+There is nothing to build. `./install.sh` puts a `vramux` shim on `$PATH` —
+which the client commands below need, since `python -m vramux` only resolves
+from inside the checkout — and `--service` also installs the systemd user unit:
+
+```bash
+./install.sh --service
+systemctl --user enable --now vramux
+```
+
+Or write the unit by hand:
 
 ```bash
 mkdir -p ~/.config/systemd/user
@@ -195,6 +207,8 @@ vramux/
   translate.py    OpenAI <-> ollama wire format
   router.py       aiohttp routes
 tests/            GPU-less; no card, no llama.cpp, no docker required
+examples/
+  docker-backend/ a complete container backend, and the contract it satisfies
 ```
 
 ## Tests
@@ -232,3 +246,13 @@ resident down with it.
 Serving also does not take leases for its own residents yet. It does not need
 to: the budget is anchored on what the device reports, so a resident is
 accounted for whether or not anybody wrote it down.
+
+## Contributing
+
+`CONTRIBUTING.md`, and `DESIGN.md` before it. The two arguments most worth
+reading first are why the budget is anchored on what the device reports, and
+why exactly one model is resident at a time.
+
+## License
+
+Apache-2.0. See `LICENSE`.
