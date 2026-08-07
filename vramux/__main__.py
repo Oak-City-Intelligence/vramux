@@ -2,7 +2,9 @@
 
 `python -m vramux` runs the ollama-compatible router — no subcommand, because
 that is what the service unit invokes and what everything on the machine
-expects. `python -m vramux state` reads the card and exits.
+expects. Every other subcommand is a *client*: it talks to a running router
+over HTTP and exits. `state` is the exception that also works without one, and
+says so when it does.
 """
 
 import argparse
@@ -12,9 +14,9 @@ import sys
 
 from aiohttp import web
 
-from . import env
+from . import cli, env
 from .budget import DEFAULT_RESERVE_MB
-from .lease import Broker
+from .lease import DEFAULT_TTL, Broker
 from .observer import CostCache, Observer
 from .registry import ModelRegistry
 from .router import make_app
@@ -125,14 +127,45 @@ def main() -> None:
     parser.add_argument("--reserve-mb", type=int,
                         default=env.get_int("RESERVE_MB", DEFAULT_RESERVE_MB),
                         help="headroom held back from every grant")
-    sub = parser.add_subparsers(dest="command")
+    sub = parser.add_subparsers(dest="subcommand")
     sub.add_parser("serve", help="run the router (the default)")
     sub.add_parser("state", help="print what is on the GPU and exit")
 
+    p_lease = sub.add_parser(
+        "lease", help="hold VRAM for the lifetime of a command",
+        description="vramux lease --mb 18000 --owner batch -- ./stage2.sh",
+    )
+    p_lease.add_argument("--mb", type=int, required=True, help="megabytes to reserve")
+    p_lease.add_argument("--owner", required=True, help="who is holding it, for the log")
+    p_lease.add_argument("--ttl", type=float, default=DEFAULT_TTL,
+                         help="seconds before the lease expires unrenewed")
+    p_lease.add_argument("--wait", type=float, default=0.0,
+                         help="seconds to wait for room before giving up")
+    p_lease.add_argument("--priority", type=int, default=5)
+    p_lease.add_argument("command", nargs=argparse.REMAINDER,
+                         help="the command to run, after `--`")
+
+    p_free = sub.add_parser("free", help="wait until N MiB could be granted")
+    p_free.add_argument("--mb", type=int, required=True)
+    p_free.add_argument("--wait", type=float, default=0.0)
+
+    p_evict = sub.add_parser("evict", help="unload a resident model by name")
+    p_evict.add_argument("tag")
+
+    sub.add_parser("leases", help="list the leases currently held")
+
     args = parser.parse_args()
 
-    if args.command == "state":
-        raise SystemExit(_state(args))
+    clients = {
+        "state": _state,
+        "lease": cli.lease,
+        "free": cli.free,
+        "evict": cli.evict,
+        "leases": cli.leases,
+    }
+    handler = clients.get(args.subcommand)
+    if handler is not None:
+        raise SystemExit(handler(args))
     _serve(args)
 
 
