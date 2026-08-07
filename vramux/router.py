@@ -19,7 +19,7 @@ from aiohttp import web
 
 from . import env
 from .registry import ModelRegistry
-from .residency import ResidencyArbiter
+from .residency import BackendLoading, ResidencyArbiter
 from .translate import (
     _JSON_GRAMMAR,
     _is_unload_request,
@@ -139,6 +139,10 @@ class Router:
                 for a in snap.attributions
             ],
             "unlocated_owners": snap.unlocated_owners,
+            "residents": [r.tag for r in self.arbiter.residents],
+            # A load in progress, so a slow cold container reads as a wait
+            # rather than as a card that has stopped answering.
+            "loading": self.arbiter.loading,
             "costs": observer.cache.all(),
         })
 
@@ -174,7 +178,10 @@ class Router:
             return web.json_response({"error": f"model '{model}' not found"}, status=404)
         if _is_unload_request(body):
             return await self._handle_unload(model)
-        await self.arbiter.acquire(spec)
+        try:
+            await self.arbiter.acquire(spec)
+        except BackendLoading as exc:
+            return _still_loading(exc)
         try:
             stream = bool(body.get("stream", True))
             upstream_payload = {
@@ -207,7 +214,10 @@ class Router:
             return web.json_response({"error": f"model '{model}' not found"}, status=404)
         if _is_unload_request(body):
             return await self._handle_unload(model)
-        await self.arbiter.acquire(spec)
+        try:
+            await self.arbiter.acquire(spec)
+        except BackendLoading as exc:
+            return _still_loading(exc)
         try:
             stream = bool(body.get("stream", True))
             want_json = body.get("format") == "json"
@@ -233,7 +243,10 @@ class Router:
         spec = self._resolve_spec(model)
         if not spec:
             return web.json_response({"error": f"model '{model}' not found"}, status=404)
-        await self.arbiter.acquire(spec)
+        try:
+            await self.arbiter.acquire(spec)
+        except BackendLoading as exc:
+            return _still_loading(exc)
         try:
             inp = body.get("prompt") or body.get("input") or ""
             upstream_payload = {"model": spec.served_name, "input": inp}
@@ -267,7 +280,10 @@ class Router:
         spec = self._resolve_spec(model)
         if not spec:
             return web.json_response({"error": f"model '{model}' not found"}, status=404)
-        await self.arbiter.acquire(spec)
+        try:
+            await self.arbiter.acquire(spec)
+        except BackendLoading as exc:
+            return _still_loading(exc)
         try:
             body["model"] = spec.served_name
 
@@ -338,6 +354,18 @@ class Router:
                 await resp.write(ollama_line)
         await resp.write_eof()
         return resp
+
+
+def _still_loading(exc: BackendLoading) -> web.Response:
+    """503 with a reason, instead of a socket that never answers.
+
+    `Retry-After` is deliberately short: whatever is loading is nearly always
+    about to finish, and the caller should come back rather than fail over.
+    """
+    log.warning("refusing a request: %s", exc)
+    return web.json_response(
+        {"error": str(exc)}, status=503, headers={"Retry-After": "10"}
+    )
 
 
 def make_app(registry: ModelRegistry, arbiter: ResidencyArbiter) -> web.Application:

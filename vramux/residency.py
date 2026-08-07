@@ -34,6 +34,22 @@ log = logging.getLogger("vramux.residency")
 # a second one fits. Every other part of this module is already plural.
 _ADMITTED_RESIDENTS = 1
 
+# A cold container load legitimately takes minutes. Rather than let the card
+# look wedged, a caller waiting behind it says so on this cadence.
+_WAIT_LOG_INTERVAL = 15.0
+
+# How long a waiter tolerates a load overrunning its own startup budget before
+# giving up. The load is bounded; this is the slack on top of that bound.
+_WAIT_SLACK = 30.0
+
+
+class BackendLoading(RuntimeError):
+    """A load is in progress and did not finish within its own budget.
+
+    Raised instead of waiting forever, so the caller gets a "still loading,
+    try again" rather than a socket that never answers.
+    """
+
 
 @dataclass
 class Resident:
@@ -58,6 +74,23 @@ class Resident:
         return self.spec.tag
 
 
+@dataclass
+class Loading:
+    """A load in progress, so a waiter can report a wait instead of a silence."""
+
+    tag: str
+    started: float
+    budget: float
+
+    @property
+    def elapsed(self) -> float:
+        return time.monotonic() - self.started
+
+    @property
+    def remaining(self) -> float:
+        return max(0.0, self.budget - self.elapsed)
+
+
 class ResidencyArbiter:
     """Decides which models are resident and routes requests to them."""
 
@@ -68,6 +101,7 @@ class ResidencyArbiter:
         idle_timeout: float = 900.0,  # 15min, matches OLLAMA_KEEP_ALIVE=15m
         startup_timeout: float = 180.0,
         drain_timeout: float = 120.0,
+        admission_timeout: float = 660.0,
         observer: Optional[Observer] = None,
     ) -> None:
         self.host = host
@@ -78,8 +112,13 @@ class ResidencyArbiter:
         self.idle_timeout = idle_timeout
         self.startup_timeout = startup_timeout
         self.drain_timeout = drain_timeout
+        # Longest a request waits for admission before being told the card is
+        # busy loading. Sits above the largest startup budget so a normal cold
+        # container never trips it — only a load that has stopped progressing.
+        self.admission_timeout = admission_timeout
 
         self._residents: Dict[str, Resident] = {}
+        self._loading: Optional[Loading] = None
         self._lock = asyncio.Lock()
         self._idle_task: Optional[asyncio.Task] = None
 
@@ -125,6 +164,18 @@ class ResidencyArbiter:
         if resident is not None:
             return resident.backend.upstream
         return f"http://{self.host}:{self.port}"
+
+    @property
+    def loading(self) -> Optional[Dict[str, object]]:
+        """The load in progress, if any — a wait made legible."""
+        load = self._loading
+        if load is None:
+            return None
+        return {
+            "tag": load.tag,
+            "elapsed_s": round(load.elapsed, 1),
+            "budget_s": round(load.budget, 1),
+        }
 
     # ---- startup --------------------------------------------------------------
 
@@ -203,8 +254,47 @@ class ResidencyArbiter:
             resident.drained.set()
 
     async def _admit(self) -> None:
-        """Take the arbiter lock."""
-        await self._lock.acquire()
+        """Take the arbiter lock, reporting a slow load as a wait, not a hang.
+
+        A cold container can hold this for ten minutes, which is correct — the
+        GPU really is busy — but a caller sitting on a silent socket cannot
+        tell that from a wedge. So: log the wait on a cadence, and bound it.
+        The bound sits above the load's own startup budget, so it fires only
+        when the load itself has stopped making progress.
+        """
+        load = self._loading
+        bound = (load.remaining + _WAIT_SLACK) if load else self.admission_timeout
+        reporter = (
+            asyncio.create_task(self._report_wait()) if self._lock.locked() else None
+        )
+        try:
+            await asyncio.wait_for(self._lock.acquire(), timeout=bound)
+        except asyncio.TimeoutError:
+            raise BackendLoading(self._wait_message(bound)) from None
+        finally:
+            if reporter is not None:
+                reporter.cancel()
+
+    def _wait_message(self, bound: float) -> str:
+        load = self._loading
+        if load is None:
+            return f"the GPU is busy and did not free up within {bound:.0f}s"
+        return (
+            f"{load.tag} is still loading after {load.elapsed:.0f}s "
+            f"(budget {load.budget:.0f}s) — try again shortly"
+        )
+
+    async def _report_wait(self) -> None:
+        while True:
+            await asyncio.sleep(_WAIT_LOG_INTERVAL)
+            load = self._loading
+            if load is None:
+                log.info("waiting for the GPU to free up")
+            else:
+                log.info(
+                    "waiting: %s is still loading (%.0fs of a %.0fs budget)",
+                    load.tag, load.elapsed, load.budget,
+                )
 
     # ---- residency changes ----------------------------------------------------
 
@@ -248,6 +338,7 @@ class ResidencyArbiter:
         resident = Resident(spec=spec, backend=backend)
         self._residents[spec.tag] = resident
         budget = self._startup_budget(spec)
+        self._loading = Loading(tag=spec.tag, started=time.monotonic(), budget=budget)
         try:
             if self.observer is None:
                 await backend.start(spec, budget)
@@ -261,6 +352,8 @@ class ResidencyArbiter:
         except Exception:
             await self._stop_resident(resident)
             raise
+        finally:
+            self._loading = None
         self._ensure_idle_watcher()
         return resident
 
@@ -292,7 +385,12 @@ class ResidencyArbiter:
             await self.observer.observe_unload(tag, before)
 
     async def stop(self) -> None:
-        """Evict everything. Used on shutdown and by the unload endpoint."""
+        """Evict everything. Used on shutdown and by the unload endpoint.
+
+        Takes the lock directly rather than going through `_admit`: an unload
+        that arrives mid-load should queue behind it, and shutdown must not be
+        able to fail with `BackendLoading`.
+        """
         async with self._lock:
             for resident in self.residents:
                 await self._stop_resident(resident)
