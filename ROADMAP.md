@@ -321,6 +321,38 @@ value if it turns out to be harder than expected.
 **Exit:** no project on the machine reimplements VRAM reasoning. The
 `vram-free` helper and the GPU advisor are gone.
 
+### In progress, 2026-08-07
+
+All four clients now ask vramux instead of reading the device themselves. Two
+of them could take a commit; the rest live in trees that are not under version
+control, which is recorded here because that work is otherwise invisible.
+
+| client | was | now |
+|---|---|---|
+| batch pipeline | polled its own toolbox for free VRAM against a hardcoded floor | gates on the smaller of that reading and vramux's budget |
+| video pipeline | `keep_alive:0`, then 30x2s of `nvidia-smi` | `vramux evict` (which drains first) + `vramux free --wait` |
+| the `vram-free` helper | `nvidia-smi` free + `keep_alive:0` + a 2 s poll loop | the same three calls, answered by the broker |
+| captioning tool | ~360 lines inferring container VRAM by subtraction | the broker's per-process attribution and measured costs |
+| image stack | nothing at all | warns when the card is too full to bother starting; opt-in leaseholder |
+
+**The container question is answered.** The image stack took a 12 000 MB lease
+naming the host PID from `docker compose top` while the container already held
+980 MB; `outstanding` came back 11 020. Reclaim needs nothing beyond `pids` on
+the acquire request, so the compose-aware path in vramux that §13 anticipated is
+not required.
+
+The captioning tool is the clearest case for the whole project: its own comments
+said container VRAM "cannot be isolated", so it guessed by subtracting an
+estimate from the total. The broker measures it, and measures what each model
+costs, so two guesses became two readings.
+
+What the migrations did *not* do: nothing holds a lease for its entire working
+period by default. Leaseholder mode in the image stack is opt-in, because that
+container idles for long stretches with its models unloaded and a standing
+reservation over an idle container would starve the box while looking
+principled. Turning it on by default wants the cooperative-yield path, which is
+Stage 6.
+
 ## Stage 6 — Multi-residency
 
 **Needs a free GPU and the Stage 2 dataset. Do not start it without both.**

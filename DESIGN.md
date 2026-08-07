@@ -226,8 +226,15 @@ through admission.
 Container-resident consumers are the common case here — image stacks and
 captioning backends typically run their GPU work in containers — so PID attribution
 must map a container's processes to the lease. NVML reports host PIDs for
-container processes, which makes this tractable, but the mapping needs testing
-rather than assuming.
+container processes, which makes this tractable.
+
+**Tested, not assumed.** A container stack took a 12 000 MB lease naming the
+host PID from `docker compose top` while its process already held 980 MB on the
+card; the broker charged the difference and reported `outstanding` as 11 020.
+No mechanism beyond `pids` in the acquire request was needed. Two things make
+it work and both are load-bearing: the PID column is read from the header
+rather than by index, and attribution matches a process *or any of its
+descendants*, so a wrapper's pid covers the command it runs.
 
 Same mechanism covers first-acquisition by a consumer that already allocated
 before ever talking to vramux. It is not a special case.
