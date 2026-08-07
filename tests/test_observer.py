@@ -20,7 +20,7 @@ from vramux.observer import (
     cost_key,
 )
 from vramux.registry import KIND_DOCKER, ModelSpec
-from vramux.supervisor import parse_compose_top
+from vramux.backends import parse_compose_top
 
 
 def device(used=1000, total=24564, procs=()):

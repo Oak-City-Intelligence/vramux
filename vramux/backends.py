@@ -1,17 +1,17 @@
-"""Supervises the single GPU slot, swapping models on demand.
+"""What it takes to be a backend, and the two kinds that exist.
 
-llama-server serves one model per process. Ollama auto-loads/unloads. The
-supervisor mimics that: when a request asks for a different model than the
-one currently loaded, the running backend is torn down and the new one is
-started. After `idle_timeout`, it is shut down to free GPU memory.
-
-Two backends implement that lifecycle:
+A backend is one loaded model with an OpenAI-compatible HTTP server in front
+of it. The arbiter decides *which* backends are resident; this module is only
+concerned with getting one up, knowing whether it is working, and getting it
+down again.
 
 * `ProcessBackend` — spawns llama-server on a local GGUF.
 * `DockerComposeBackend` — brings a compose service up and down. For models
-  llama.cpp cannot load at all, which ship their own OpenAI-compatible server.
+  llama.cpp cannot load at all, which ship their own server.
 
-Both occupy the same slot, so a GGUF and a container never hold VRAM at once.
+`Backend` is the contract, pinned deliberately: vLLM and TensorRT-LLM are the
+obvious next kinds, and the interface should stop moving before they arrive. A
+new kind is a new class in this file — the arbiter does not learn about it.
 """
 
 from __future__ import annotations
@@ -23,15 +23,86 @@ import shutil
 import signal
 import time
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Protocol, runtime_checkable
 
 import aiohttp
 
 from . import env
-from .observer import Observer
-from .registry import KIND_DOCKER, ModelSpec
+from .registry import ModelSpec
 
-log = logging.getLogger("vramux.supervisor")
+log = logging.getLogger("vramux.backends")
+
+
+@runtime_checkable
+class Backend(Protocol):
+    """One model, running, reachable over HTTP.
+
+    Everything here is per-instance: no implementation may assume it is the
+    only backend on the card, because from Stage 6 it will not be.
+    """
+
+    #: Base URL of this backend's server. Valid once `start()` returns.
+    upstream: str
+
+    def alive(self) -> bool:
+        """Whether this backend believes its server is up.
+
+        Cheap and local — no I/O. "Up" is not "working": see `healthy()`.
+        """
+        ...
+
+    async def start(self, spec: ModelSpec, startup_timeout: float) -> None:
+        """Bring the model up and return only once it answers /health.
+
+        Raises on failure, having cleaned up whatever it started. Must not
+        return early: the caller treats a return as "ready to serve".
+        """
+        ...
+
+    async def stop(self) -> None:
+        """Release the VRAM. Idempotent, and must not raise on an already-stopped
+        backend — it is called on the error path of `start()`."""
+        ...
+
+    async def healthy(self) -> bool:
+        """One cheap probe: is this backend actually answering?
+
+        Lives here rather than on the arbiter because what "healthy" means is
+        the kind's business — an HTTP GET today, possibly not for the next
+        kind. The arbiter owns the *policy* of when to ask and what to do with
+        the answer, which is why this returns a bool and never acts on it.
+        """
+        ...
+
+    async def pids(self) -> List[int]:
+        """Host PIDs holding this backend's VRAM, best effort.
+
+        Used only for attributing an NVML reading to an owner. An empty list
+        means "could not tell", never "holding nothing", and must never affect
+        whether a load proceeds.
+        """
+        ...
+
+    def adopt(self) -> None:
+        """Declare that an instance started by a *previous* process is running,
+        so that `stop()` will tear it down.
+
+        Used by reconcile at startup. Kinds with no way to re-attach to an
+        orphan raise; that is a property of the kind, not a failure.
+        """
+        ...
+
+
+async def http_healthy(upstream: str, timeout: float = 5.0) -> bool:
+    """One GET against `upstream/health`. Any error is a no, never an exception."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{upstream}/health", timeout=aiohttp.ClientTimeout(total=timeout)
+            ) as resp:
+                return resp.status == 200
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        return False
 
 
 def resolve_llama_server_bin() -> Optional[Path]:
@@ -91,9 +162,22 @@ class ProcessBackend:
     def alive(self) -> bool:
         return self._proc is not None and self._proc.returncode is None
 
+    async def healthy(self) -> bool:
+        return await http_healthy(self.upstream)
+
     async def pids(self) -> List[int]:
         """The process holding VRAM is the one we spawned."""
         return [self._proc.pid] if self._proc is not None else []
+
+    def adopt(self) -> None:
+        """Cannot re-attach: a subprocess handle does not survive our restart.
+
+        An orphaned llama-server is a different problem from an orphaned
+        container — there is no handle to reclaim, only a PID we never recorded.
+        """
+        raise NotImplementedError(
+            "a llama-server subprocess cannot be adopted after a restart"
+        )
 
     async def start(self, spec: ModelSpec, startup_timeout: float) -> None:
         binary = resolve_llama_server_bin()
@@ -216,10 +300,23 @@ class DockerComposeBackend:
             )
         self.spec = spec
         self.upstream = f"http://127.0.0.1:{spec.port}"
-        self._started = False
+        self._running = False
 
     def alive(self) -> bool:
-        return self._started
+        return self._running
+
+    async def healthy(self) -> bool:
+        return await http_healthy(self.upstream)
+
+    def adopt(self) -> None:
+        """Claim a container this process did not start.
+
+        Compose is addressed by file and service name, not by a handle, so an
+        instance left behind by a previous router is reachable by exactly the
+        same commands. Adopting it is therefore only a matter of admitting it
+        exists, after which `stop()` does the real work.
+        """
+        self._running = True
 
     async def pids(self) -> List[int]:
         """Host PIDs of the container's processes, best effort.
@@ -229,7 +326,7 @@ class DockerComposeBackend:
         container backend. This only affects whether a load is attributed or
         counted as foreign, never whether it proceeds.
         """
-        if not self._started:
+        if not self._running:
             return []
         rc, out = await self._run("top", self.spec.compose_service, timeout=15)
         if rc != 0:
@@ -263,7 +360,7 @@ class DockerComposeBackend:
         rc, out = await self._run("up", "-d", service)
         if rc != 0:
             raise RuntimeError(f"docker compose up failed for {spec.tag}: {out}")
-        self._started = True
+        self._running = True
 
         async def _died_check() -> Optional[str]:
             rc, out = await self._run("ps", "-q", "--status", "running", service, timeout=15)
@@ -297,7 +394,7 @@ class DockerComposeBackend:
         raise RuntimeError(f"container for {spec.tag} did not become ready within {startup_timeout}s")
 
     async def stop(self) -> None:
-        if not self._started:
+        if not self._running:
             return
         service = self.spec.compose_service
         # `stop`, not `down`: keeps the container (and its warm caches) around
@@ -305,229 +402,4 @@ class DockerComposeBackend:
         rc, out = await self._run("stop", service, timeout=90)
         if rc != 0:
             log.warning("docker compose stop failed for %s: %s", self.spec.tag, out)
-        self._started = False
-
-
-class LlamaServerSupervisor:
-    """Owns the single GPU slot: one backend loaded at a time."""
-
-    def __init__(
-        self,
-        host: str = "127.0.0.1",
-        port: int = 18080,
-        idle_timeout: float = 900.0,  # 15min, matches OLLAMA_KEEP_ALIVE=15m
-        startup_timeout: float = 180.0,
-        drain_timeout: float = 120.0,
-        observer: Optional[Observer] = None,
-    ) -> None:
-        self.host = host
-        self.port = port
-        # None disables observation entirely. It only ever watches, so nothing
-        # below is allowed to change whether a load succeeds.
-        self.observer = observer
-        self.idle_timeout = idle_timeout
-        self.startup_timeout = startup_timeout
-        self.drain_timeout = drain_timeout
-
-        self._backend = None
-        self._current: Optional[ModelSpec] = None
-        self._last_use: float = 0.0
-        self._lock = asyncio.Lock()
-        self._idle_task: Optional[asyncio.Task] = None
-        # In-flight request accounting so a model swap never tears down a
-        # llama-server that is still streaming a response. `_drained` is set
-        # exactly when `_inflight == 0`.
-        self._inflight: int = 0
-        self._drained = asyncio.Event()
-        self._drained.set()
-
-    @property
-    def current_tag(self) -> Optional[str]:
-        return self._current.tag if self._current else None
-
-    @property
-    def current_spec(self) -> Optional[ModelSpec]:
-        """The ModelSpec currently loaded (running), or None when idle."""
-        if self._backend is not None and self._backend.alive():
-            return self._current
-        return None
-
-    @property
-    def upstream(self) -> str:
-        """Base URL of the loaded backend.
-
-        Backend-dependent: llama-server binds our fixed upstream port, a docker
-        model publishes its own. Only meaningful between acquire() and
-        release(); falls back to the llama-server port when nothing is loaded.
-        """
-        if self._backend is not None:
-            return self._backend.upstream
-        return f"http://{self.host}:{self.port}"
-
-    async def _backend_healthy(self) -> bool:
-        """One cheap GET against the loaded backend's /health.
-
-        Only consulted when nothing is in flight, so a busy-but-fine backend is
-        never torn down for being slow to answer a health probe.
-        """
-        if self._backend is None:
-            return False
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{self._backend.upstream}/health",
-                    timeout=aiohttp.ClientTimeout(total=5),
-                ) as resp:
-                    return resp.status == 200
-        except (aiohttp.ClientError, asyncio.TimeoutError):
-            return False
-
-    async def reconcile(self, specs) -> None:
-        """Stop any router-managed container left running by a previous process.
-
-        Without this, a router restart while a docker model is loaded leaves the
-        container holding ~20 GB: the fresh supervisor believes the slot is free
-        and happily starts a llama-server alongside it, and both OOM.
-        """
-        for spec in specs:
-            if spec.kind != KIND_DOCKER:
-                continue
-            try:
-                backend = DockerComposeBackend(spec)
-                backend._started = True  # force the stop path
-                await backend.stop()
-                log.info("reconcile: ensured %s container is stopped", spec.tag)
-            except Exception as exc:  # never block startup on cleanup
-                log.warning("reconcile: could not stop %s: %s", spec.tag, exc)
-
-    def _effective_idle_timeout(self) -> float:
-        if self._current is not None and self._current.idle_timeout is not None:
-            return self._current.idle_timeout
-        return self.idle_timeout
-
-    async def acquire(self, spec: ModelSpec) -> None:
-        """Ensure `spec` is loaded and register one in-flight request on it.
-
-        If a *different* model is loaded, the swap is deferred until all
-        in-flight requests on the current model have drained — so a streaming
-        response is never killed underneath its caller. Every successful
-        acquire() MUST be paired with exactly one release().
-        """
-        async with self._lock:
-            already = (
-                self._backend is not None
-                and self._backend.alive()
-                and self._current is spec
-            )
-            # "Running" is not "working". A backend can wedge with its process
-            # or container still up — one container backend does exactly this if its
-            # detokenizer stalls, answering /health with 503 while accepting
-            # requests that never return. Reusing it would feed every later
-            # request into a black hole, so verify health and recycle if red.
-            if already and self._inflight == 0 and not await self._backend_healthy():
-                log.warning("loaded backend %s is unhealthy — recycling", self.current_tag)
-                await self._stop_unlocked()
-                already = False
-            if not already:
-                if self._backend is not None and self._backend.alive():
-                    if self._inflight > 0:
-                        log.info(
-                            "deferring swap %s -> %s until %d in-flight request(s) drain",
-                            self.current_tag, spec.tag, self._inflight,
-                        )
-                        try:
-                            await asyncio.wait_for(self._drained.wait(), timeout=self.drain_timeout)
-                        except asyncio.TimeoutError:
-                            log.warning(
-                                "drain timed out after %.0fs with %d in-flight; forcing swap",
-                                self.drain_timeout, self._inflight,
-                            )
-                    log.info("swapping model: %s -> %s", self.current_tag, spec.tag)
-                    await self._stop_unlocked()
-                await self._start_unlocked(spec)
-            self._inflight += 1
-            self._drained.clear()
-            self._last_use = time.monotonic()
-
-    def release(self) -> None:
-        """Mark one in-flight request complete; wake a waiting swap at zero."""
-        self._inflight = max(0, self._inflight - 1)
-        if self._inflight == 0:
-            self._drained.set()
-
-    def _make_backend(self, spec: ModelSpec):
-        if spec.kind == KIND_DOCKER:
-            return DockerComposeBackend(spec)
-        return ProcessBackend(self.host, self.port)
-
-    async def _start_unlocked(self, spec: ModelSpec) -> None:
-        backend = self._make_backend(spec)
-        self._backend = backend
-        self._current = spec
-        # A docker model can legitimately take minutes on a cold container;
-        # give it its own budget rather than the llama-server one.
-        startup_timeout = self.startup_timeout
-        if spec.kind == KIND_DOCKER:
-            startup_timeout = max(startup_timeout, 600.0)
-        try:
-            if self.observer is None:
-                await backend.start(spec, startup_timeout)
-            else:
-                async with self.observer.measuring(spec):
-                    await backend.start(spec, startup_timeout)
-                    # Claim before the window closes, or the process we just
-                    # started reads as foreign drift and voids its own
-                    # measurement.
-                    self.observer.claim(spec.tag, await self._backend_pids(backend))
-        except Exception:
-            await self._stop_unlocked()
-            raise
-        self._ensure_idle_watcher()
-
-    async def _backend_pids(self, backend) -> List[int]:
-        try:
-            return await backend.pids()
-        except Exception as exc:  # attribution is a nicety, never a blocker
-            log.debug("could not determine pids for the running backend: %s", exc)
-            return []
-
-    async def _stop_unlocked(self) -> None:
-        if self._backend is None:
-            return
-        tag = self.current_tag
-        before = None
-        if self.observer is not None:
-            before = await self.observer._safe_snapshot()
-        try:
-            await self._backend.stop()
-        finally:
-            self._backend = None
-            self._current = None
-        if self.observer is not None and tag is not None:
-            self.observer.release(tag)
-            await self.observer.observe_unload(tag, before)
-
-    async def stop(self) -> None:
-        async with self._lock:
-            await self._stop_unlocked()
-
-    def touch(self) -> None:
-        self._last_use = time.monotonic()
-
-    def _ensure_idle_watcher(self) -> None:
-        if self._idle_task and not self._idle_task.done():
-            return
-        self._idle_task = asyncio.create_task(self._idle_watch())
-
-    async def _idle_watch(self) -> None:
-        while True:
-            await asyncio.sleep(30)
-            if self._backend is None or not self._backend.alive():
-                return
-            timeout = self._effective_idle_timeout()
-            if self._inflight == 0 and time.monotonic() - self._last_use > timeout:
-                log.info("idle timeout (%.0fs), unloading %s", timeout, self.current_tag)
-                async with self._lock:
-                    if self._inflight == 0:  # re-check under lock
-                        await self._stop_unlocked()
-                return
+        self._running = False

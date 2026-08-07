@@ -16,7 +16,7 @@ from . import env
 from .observer import CostCache, Observer
 from .registry import ModelRegistry
 from .router import make_app
-from .supervisor import LlamaServerSupervisor
+from .residency import ResidencyArbiter
 
 
 def _serve(args: argparse.Namespace) -> None:
@@ -25,12 +25,12 @@ def _serve(args: argparse.Namespace) -> None:
         format="%(asctime)s %(levelname)s %(name)s :: %(message)s",
     )
     registry = ModelRegistry()
-    supervisor = LlamaServerSupervisor(
+    arbiter = ResidencyArbiter(
         port=args.upstream_port,
         idle_timeout=args.idle_timeout,
         observer=Observer(device_index=args.device),
     )
-    app = make_app(registry, supervisor)
+    app = make_app(registry, arbiter)
     web.run_app(app, host=args.host, port=args.port, print=None)
 
 

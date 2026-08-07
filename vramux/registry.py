@@ -81,12 +81,13 @@ class ModelSpec:
     Two backend kinds share this shape:
 
     * ``llama-server`` (default) — a local GGUF served by a llama-server
-      subprocess the supervisor spawns.
+      subprocess vramux spawns.
     * ``docker`` — an already-built compose service that exposes an
       OpenAI-compatible server on ``port``. Used for models llama.cpp cannot
-      load at all — say a 2-bit vendor quant that needs its own CUDA kernels. The supervisor brings the container up and down exactly as
-      it starts and stops a llama-server, so both kinds compete for the single
-      GPU slot under the same swap and idle-unload rules.
+      load at all — say a 2-bit vendor quant that needs its own CUDA kernels.
+      The arbiter brings the container up and down exactly as it starts and
+      stops a llama-server, so both kinds are residents under the same
+      admission and idle-unload rules.
     """
 
     tag: str                     # ollama-style "name:variant", e.g. "qwen3.5:27b"
@@ -111,7 +112,7 @@ class ModelSpec:
     served_name_override: Optional[str] = None
     # Per-model idle timeout. A container that takes minutes to become ready
     # should not be evicted on the same schedule as a GGUF that loads in
-    # seconds. None = use the supervisor default.
+    # seconds. None = use the arbiter default.
     idle_timeout: Optional[float] = None
     # Directory of weights, for size reporting only (docker kind has no single
     # blob to stat).

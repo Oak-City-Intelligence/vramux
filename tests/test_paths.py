@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from vramux import registry as reg
-from vramux import supervisor as sup
+from vramux import backends as sup
 from vramux.registry import KIND_DOCKER, ModelRegistry, ModelSpec
 
 

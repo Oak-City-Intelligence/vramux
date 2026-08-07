@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from vramux.router import (
+from vramux.translate import (
     _is_unload_request,
     _ollama_options_to_openai,
     _openai_chat_to_ollama,

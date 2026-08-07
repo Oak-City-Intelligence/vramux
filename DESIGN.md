@@ -284,10 +284,13 @@ through a failed cost estimate.
 
 ### 6.1 The in-flight problem
 
-Residency changes the drain semantics of the current implementation. In-flight
-counting is per-resident, not global — evicting model A must not wait on
-requests in flight against model B. This is the single largest structural change
-from the existing supervisor, which has one `_backend` and one counter.
+Residency changes the drain semantics. In-flight counting is per-resident, not
+global — evicting model A must not wait on requests in flight against model B.
+This was the single largest structural change of Stage 3, and it is done: a
+`Resident` owns its backend, its counter and its own drain gate, so an eviction
+waits on its victim alone. With admission at one the distinction is invisible;
+it exists so that opening admission is a budget change, not a re-reasoning of
+every drain.
 
 ## 7. Serving language models
 
@@ -307,20 +310,36 @@ stack.
 
 ### 7.1 Backend contract
 
-Pinned as a `Protocol` before a third implementation lands:
+Pinned as a `Protocol` in `backends.py`, before a third implementation lands:
 
 ```python
 class Backend(Protocol):
     upstream: str
     def alive(self) -> bool: ...
-    async def start(self, spec: ModelSpec, timeout: float) -> None: ...
+    async def start(self, spec: ModelSpec, startup_timeout: float) -> None: ...
     async def stop(self) -> None: ...
     async def healthy(self) -> bool: ...
-    def adopt(self) -> None: ...        # claim a pre-existing instance
-    def vram_hint(self, spec) -> int | None: ...
+    async def pids(self) -> list[int]: ...   # for attribution, best effort
+    def adopt(self) -> None: ...             # claim a pre-existing instance
 ```
 
-`adopt()` replaces the current `backend._started = True` hack in `reconcile()`.
+`adopt()` replaced the `backend._started = True` hack in `reconcile()`. Only
+the container kind can honour it: compose addresses an orphan by file and
+service name, so adopting one is just admitting it exists. A subprocess handle
+does not survive our restart, so `ProcessBackend.adopt()` raises — a property
+of the kind, not a failure.
+
+`healthy()` sits here rather than on the arbiter, which is the decision Stage 3
+was required to make and not defer. What "healthy" means is the kind's
+business; *when to ask and what to do with the answer* stays the arbiter's, so
+this returns a bool and never acts on it. Both current kinds share one
+`http_healthy()` helper, which is exactly the shape a third kind would need to
+override.
+
+`vram_hint()` is deliberately **not** pinned. Nothing implements it and nothing
+calls it: the observer measures real cost instead of asking a backend to guess,
+and Stage 6 owns whatever the cost model turns out to need. Pinning a method
+with no caller would freeze a guess.
 
 Two implementations exist. vLLM and TensorRT-LLM are the obvious next ones and
 the interface should stop moving before they arrive.

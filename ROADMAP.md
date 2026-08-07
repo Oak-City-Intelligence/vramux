@@ -43,11 +43,13 @@ These constrain every stage. They are why the ordering looks conservative.
 
 ## Current state (2026-08-07)
 
-**Stages 0, 1 and 2 are done.** Stage 3, the structural refactor, is next.
+**Stages 0 to 3 are done.** Stage 4, leases, is next.
 
-- ~1,900 lines across seven modules; 119 tests, all GPU-less
-- single slot, one backend at a time, swap verified working both directions
-  (17 s cold container, 7 s container→GGUF, 16 s back)
+- ~2,600 lines across nine modules; 119 tests, all GPU-less
+- residency-shaped arbiter with per-resident in-flight counting; admission is
+  pinned at one, so behaviour is still one model at a time
+- swap verified working both directions against the live service after the
+  refactor (24 s cold container, 6 s container→GGUF)
 - under git at its final location, serving `:11434` from there as
   `vramux.service` (the old unit name kept as an alias)
 - no path resolves to this machine; a clean checkout with an empty environment
@@ -200,6 +202,27 @@ The structure that permits multi-residency exists; the budget stays shut.
 
 **Exit:** tests green, unedited. `git diff` shows no change in observable
 behaviour. A third backend kind could be added without touching the arbiter.
+
+### Done, 2026-08-07
+
+`supervisor.py` became three files: `backends.py` (the pinned `Backend`
+protocol and both kinds), `residency.py` (`Resident` + `ResidencyArbiter`), and
+`translate.py` (the wire-format functions lifted out of `router.py`, which
+dropped from 617 lines to 392). `healthy()` moved onto the protocol — the
+decision the stage was required to make and not defer, recorded with its
+reasoning in `DESIGN.md` §7.1, along with why `vram_hint()` was left off.
+
+All 119 tests stayed green with **every assertion unchanged**. What did change:
+imports, and the test doubles that implement the very interface this stage
+pinned — a fake backend has to grow `healthy()` and `adopt()` when the contract
+grows them. That is the one place the "unedited" rule could not hold literally,
+and it holds where it matters: no test was weakened or retuned to pass.
+
+Verified against the live service, not just the fakes — swap both directions
+with measurement and unload accounting, the streaming tool call (exactly one
+terminal line, carrying `tool_calls`), container reconcile through the new
+`adopt()`, and wedge recovery via `docker pause`, which is what proves
+`healthy()` still works from its new home.
 
 ## Stage 4 — Leases
 

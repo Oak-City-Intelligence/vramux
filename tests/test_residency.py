@@ -1,6 +1,6 @@
 """Swap, drain and recycle logic against a fake backend.
 
-No GPU, no subprocess, no docker. The supervisor's real backends are replaced
+No GPU, no subprocess, no docker. The arbiter's real backends are replaced
 wholesale, so what is under test is the arbitration policy itself.
 """
 
@@ -12,17 +12,22 @@ from typing import List, Optional
 import pytest
 
 from vramux.registry import KIND_DOCKER, ModelSpec
-from vramux.supervisor import LlamaServerSupervisor
+from vramux.residency import ResidencyArbiter
 
 
 class FakeBackend:
-    """Records its lifecycle into a shared event log."""
+    """Records its lifecycle into a shared event log.
 
-    def __init__(self, spec: ModelSpec, events: List[str], start_delay: float = 0.0,
+    Implements the `Backend` protocol; health is delegated back to the fake
+    arbiter so a test can turn a live backend red mid-run.
+    """
+
+    def __init__(self, spec: ModelSpec, arbiter: "FakeArbiter", start_delay: float = 0.0,
                  fail: bool = False) -> None:
         self.spec = spec
         self.upstream = "http://fake"
-        self.events = events
+        self.arbiter = arbiter
+        self.events = arbiter.events
         self.start_delay = start_delay
         self.fail = fail
         self.started = False
@@ -30,6 +35,13 @@ class FakeBackend:
 
     def alive(self) -> bool:
         return self.started
+
+    async def healthy(self) -> bool:
+        self.arbiter.health_checks += 1
+        return self.arbiter.healthy
+
+    def adopt(self) -> None:
+        self.started = True
 
     async def start(self, spec: ModelSpec, startup_timeout: float) -> None:
         self.startup_timeout = startup_timeout
@@ -50,7 +62,7 @@ class FakeBackend:
         self.started = False
 
 
-class FakeSupervisor(LlamaServerSupervisor):
+class FakeArbiter(ResidencyArbiter):
     def __init__(self, **kw):
         super().__init__(**kw)
         self.events: List[str] = []
@@ -61,14 +73,10 @@ class FakeSupervisor(LlamaServerSupervisor):
         self.fail_next_start = False
 
     def _make_backend(self, spec: ModelSpec) -> FakeBackend:
-        b = FakeBackend(spec, self.events, self.start_delay, self.fail_next_start)
+        b = FakeBackend(spec, self, self.start_delay, self.fail_next_start)
         self.fail_next_start = False
         self.backends.append(b)
         return b
-
-    async def _backend_healthy(self) -> bool:
-        self.health_checks += 1
-        return self.healthy
 
 
 def spec(tag: str, **kw) -> ModelSpec:
@@ -77,7 +85,7 @@ def spec(tag: str, **kw) -> ModelSpec:
 
 @pytest.fixture
 def sup():
-    return FakeSupervisor(drain_timeout=0.2, startup_timeout=5.0)
+    return FakeArbiter(drain_timeout=0.2, startup_timeout=5.0)
 
 
 # ---- basic slot behaviour -------------------------------------------------
@@ -239,22 +247,25 @@ async def test_per_model_idle_timeout_overrides_the_default(sup):
 
 async def test_reconcile_stops_orphaned_containers_only(monkeypatch):
     """A router restart while a container is loaded leaves it holding ~20 GB
-    while the fresh supervisor believes the slot is free."""
-    from vramux import supervisor as sup_mod
+    while the fresh arbiter believes the card is free."""
+    from vramux import residency as sup_mod
 
     stopped: List[str] = []
 
     class RecordingDocker:
         def __init__(self, spec):
             self.spec = spec
-            self._started = False
+            self._running = False
+
+        def adopt(self):
+            self._running = True
 
         async def stop(self):
-            if self._started:
+            if self._running:
                 stopped.append(self.spec.tag)
 
     monkeypatch.setattr(sup_mod, "DockerComposeBackend", RecordingDocker)
-    s = FakeSupervisor()
+    s = FakeArbiter()
     await s.reconcile([
         spec("a:1b"),
         spec("d:35b", kind=KIND_DOCKER),
@@ -264,14 +275,14 @@ async def test_reconcile_stops_orphaned_containers_only(monkeypatch):
 
 
 async def test_reconcile_failure_does_not_block_startup(monkeypatch):
-    from vramux import supervisor as sup_mod
+    from vramux import residency as sup_mod
 
     class ExplodingDocker:
         def __init__(self, spec):
             raise RuntimeError("docker not installed")
 
     monkeypatch.setattr(sup_mod, "DockerComposeBackend", ExplodingDocker)
-    await FakeSupervisor().reconcile([spec("d:35b", kind=KIND_DOCKER)])
+    await FakeArbiter().reconcile([spec("d:35b", kind=KIND_DOCKER)])
 
 
 # ---- observation ----------------------------------------------------------
@@ -313,7 +324,7 @@ class RecordingObserver:
 
 async def test_a_load_is_measured_and_its_pids_claimed():
     obs = RecordingObserver()
-    sup = FakeSupervisor(observer=obs)
+    sup = FakeArbiter(observer=obs)
     await sup.acquire(spec("a:1b"))
     assert obs.measured == ["a:1b"]
     # Claimed inside the measurement window, or the process just started reads
@@ -323,7 +334,7 @@ async def test_a_load_is_measured_and_its_pids_claimed():
 
 async def test_an_unload_releases_the_claim_and_is_observed():
     obs = RecordingObserver()
-    sup = FakeSupervisor(observer=obs)
+    sup = FakeArbiter(observer=obs)
     await sup.acquire(spec("a:1b"))
     sup.release()
     await sup.stop()
@@ -337,8 +348,8 @@ async def test_a_backend_that_cannot_report_pids_still_loads():
             raise RuntimeError("docker compose top failed")
 
     obs = RecordingObserver()
-    sup = FakeSupervisor(observer=obs)
-    sup._make_backend = lambda spec_: NoPids(spec_, sup.events)
+    sup = FakeArbiter(observer=obs)
+    sup._make_backend = lambda spec_: NoPids(spec_, sup)
     await sup.acquire(spec("d:35b", kind=KIND_DOCKER))
     assert sup.current_tag == "d:35b"
     assert obs.claims == [("d:35b", [])]
@@ -346,7 +357,7 @@ async def test_a_backend_that_cannot_report_pids_still_loads():
 
 async def test_observation_is_optional():
     """The supervisor must run identically with no observer attached."""
-    sup = FakeSupervisor(observer=None)
+    sup = FakeArbiter(observer=None)
     await sup.acquire(spec("a:1b"))
     sup.release()
     await sup.stop()

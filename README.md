@@ -137,8 +137,10 @@ vramux/
   nvml.py         reading the device — totals and per-process usage
   observer.py     attribution, measurement, the cost cache
   registry.py     ModelSpec, YAML config, dir scan, ollama-blob discovery
-  supervisor.py   the GPU slot: ProcessBackend + DockerComposeBackend
-  router.py       aiohttp routes + OpenAI <-> ollama translation
+  backends.py     the Backend contract: ProcessBackend + DockerComposeBackend
+  residency.py    who is on the card: admission, eviction, drain, idle
+  translate.py    OpenAI <-> ollama wire format
+  router.py       aiohttp routes
 tests/            GPU-less; no card, no llama.cpp, no docker required
 ```
 
