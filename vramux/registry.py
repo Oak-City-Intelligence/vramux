@@ -110,6 +110,15 @@ class ModelSpec:
     # `--alias <tag>` so tag works there; a docker backend has its own served
     # name baked in at container start, so requests must use that.
     served_name_override: Optional[str] = None
+    # What this model costs on the card, when nobody has measured it yet.
+    # Required for container backends if they are ever to be admitted beside
+    # another model: their internals are not introspectable, so there is
+    # nothing to estimate from. A measured cost always wins over this.
+    vram_mb: Optional[int] = None
+    # This model wants the whole card. Admission evicts every other resident
+    # for it and never admits anything beside it. Declaring it is cheaper than
+    # discovering it through a failed load.
+    exclusive: bool = False
     # Per-model idle timeout. A container that takes minutes to become ready
     # should not be evicted on the same schedule as a GGUF that loads in
     # seconds. None = use the arbiter default.
@@ -294,6 +303,8 @@ class ModelRegistry:
                         weights_dir=(Path(entry["weights_dir"]).expanduser() if entry.get("weights_dir") else None),
                         quantization=entry.get("quantization", "unknown"),
                         family=entry.get("family"),
+                        vram_mb=(int(entry["vram_mb"]) if entry.get("vram_mb") is not None else None),
+                        exclusive=bool(entry.get("exclusive", False)),
                     )
                     continue
                 gguf = Path(entry["gguf"]).expanduser()
@@ -306,6 +317,8 @@ class ModelRegistry:
                     extra_args=list(entry.get("extra_args", [])),
                     is_embedding=bool(entry.get("embedding", False)),
                     family=entry.get("family"),
+                    vram_mb=(int(entry["vram_mb"]) if entry.get("vram_mb") is not None else None),
+                    exclusive=bool(entry.get("exclusive", False)),
                 )
         # Drop auto-discovered specs whose GGUF is already covered by YAML —
         # keeps the listed-tags clean and avoids ugly filename-derived names.

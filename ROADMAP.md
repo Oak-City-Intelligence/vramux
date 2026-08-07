@@ -445,6 +445,48 @@ to within 1 627 MiB of full during a stage that lasted fourteen seconds — an
 event the history could not see at all. The knob clamps up to the 5 s lease
 sweep it rides on, and says so when it does.
 
+### What Stage 6 landed, 2026-08-07
+
+Admission is open. `_ADMITTED_RESIDENTS = 1` is gone; what decides now is
+measured cost against `budget.free_mb` — the same arithmetic a lease is granted
+from, not a second accounting built from declared costs.
+
+Four rules, in the order admission applies them:
+
+1. **`exclusive: true`, either way round.** A model that says it wants the card
+   gets it alone, and nothing joins a resident that said so.
+2. **No known cost, no sharing.** Measured or declared in config, or the model
+   is served alone. There is deliberately no estimate in this path: §4.2
+   describes one and admission does not use it, because an underestimate is an
+   OOM that takes the innocent resident with it. A model becomes packable the
+   first time it loads, since that load measures it.
+3. **The resident ceiling** (`VRAMUX_MAX_RESIDENTS`, default 2). A bound on
+   backend processes and upstream ports, not on memory.
+4. **The budget.** Evict least-recently-used until the incoming cost fits in
+   what is free.
+
+Everything else the stage needed came with it: a port pool so two
+llama-servers can coexist, per-tag upstream routing (a global `upstream`
+would have proxied every request to whichever model was admitted last),
+`/api/ps` reporting a list, `keep_alive: 0` unloading the model named rather
+than the card, and `auto` resolving to the most recently *used* resident
+rather than the most recently admitted one.
+
+The failure path §11 asked for exists: a load that fails beside a peer evicts
+the peers and retries once, alone. Free memory is not always allocatable
+memory, and one retry turns that into a served request rather than an error. A
+load that fails on an empty card is not retried — that is a broken model, and
+looping on it turns a clear failure into a hung request.
+
+**Verified on the card**, not just in tests: two 9B models resident and
+serving at 14 009 MiB; the tight pair — 9 231 + 10 993 — resident at 21 449
+MiB with no OOM; a 27B correctly evicting both; and a 12 000 MiB leaseholder
+being enough to stop a second model being admitted, which is residency and
+leasing agreeing through one budget rather than two.
+
+**Exit met:** two models resident at once, admitted from measured costs. The
+week of normal use is still ahead of it.
+
 ## Stage 7 — The console
 
 Only now, and only because everything under it is real.

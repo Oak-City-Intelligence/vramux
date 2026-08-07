@@ -4,15 +4,29 @@ A *resident* is one model held in VRAM: its backend, its own in-flight request
 count, its own idle clock. The arbiter admits residents, evicts them to make
 room, and answers "where do I send this request".
 
-Everything here is written for more than one resident. Admission is the single
-exception: `_ADMITTED_RESIDENTS` is 1, so today's behaviour is exactly the old
-one-model-at-a-time swap. Opening it needs a memory budget built from measured
-costs, which is Stage 6's job — the structure is ready, the budget is shut.
+The budget is open: more than one model may be resident, and what decides is
+measured cost against the same budget leases are granted from. Three rules
+carry the whole of it, and each exists because of a specific way this goes
+wrong:
 
-The distinction that matters: in-flight counting is *per resident*. Evicting
-model A waits on requests in flight against A, not against B. With one
-resident that is a distinction without a difference; with two it is the whole
-game, and retrofitting it later would mean re-reasoning about every drain.
+* **A model with no known cost is served alone.** Measured or declared, or it
+  gets the card to itself — there is no estimate anywhere in this path. An
+  underestimate is an OOM, and an OOM on a shared card takes the innocent
+  resident down with the greedy one. A model becomes packable the first time
+  it loads, because that load measures it.
+* **Room is decided from `budget.free_mb`, never from a sum of resident
+  costs.** The device already reports what residents, leaseholders and foreign
+  processes are using; adding declared costs on top of that would count the
+  same memory twice. This is the same arithmetic a lease is granted from, on
+  purpose — two accountings of one card drift, and only one of them is tested.
+* **Admitting is a guess until the allocation exists.** Free memory is not
+  always allocatable memory, so a load can still fail after admission says
+  yes. That path evicts the peers and retries once, alone, rather than
+  reporting a failure that a second attempt would have survived.
+
+The distinction that made it possible: in-flight counting is *per resident*.
+Evicting model A waits on requests in flight against A, not against B. It was
+built in Stage 3, when it was invisible.
 """
 
 from __future__ import annotations
@@ -24,15 +38,17 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 from .backends import Backend, DockerComposeBackend, ProcessBackend
-from .observer import Observer
+from .observer import Observer, known_cost_mb
 from .registry import KIND_DOCKER, ModelSpec
 
 log = logging.getLogger("vramux.residency")
 
 
-# How many models may be resident at once. One, until measured costs can prove
-# a second one fits. Every other part of this module is already plural.
-_ADMITTED_RESIDENTS = 1
+# Ceiling on residents, whatever the budget says. The budget is the real
+# constraint; this is a bound on how many upstream ports and backend processes
+# one card is allowed to sprout, and a place to stand if packing ever turns
+# out to cost more than it saves.
+DEFAULT_MAX_RESIDENTS = 2
 
 # A cold container load legitimately takes minutes. Rather than let the card
 # look wedged, a caller waiting behind it says so on this cadence.
@@ -65,6 +81,9 @@ class Resident:
     inflight: int = 0
     last_use: float = 0.0
     drained: asyncio.Event = field(default_factory=asyncio.Event)
+    # The upstream port this resident borrowed, returned to the pool when it
+    # stops. None for a container, which publishes its own.
+    port: Optional[int] = None
 
     def __post_init__(self) -> None:
         self.drained.set()
@@ -103,9 +122,21 @@ class ResidencyArbiter:
         drain_timeout: float = 120.0,
         admission_timeout: float = 660.0,
         observer: Optional[Observer] = None,
+        max_residents: int = DEFAULT_MAX_RESIDENTS,
+        budget=None,
     ) -> None:
         self.host = host
         self.port = port
+        self.max_residents = max(1, int(max_residents))
+        # `budget()` is the broker's, injected the same way `loading` goes the
+        # other way, so residency does not import the broker and the broker
+        # does not import residency. Without it — no observation, no leasing —
+        # admission has no honest way to decide a second resident fits, and
+        # falls back to serving one at a time.
+        self._budget = budget
+        # Consecutive upstream ports, one per possible llama-server. Containers
+        # publish their own and never take one.
+        self._free_ports: List[int] = [port + i for i in range(self.max_residents)]
         # None disables observation entirely. It only ever watches, so nothing
         # below is allowed to change whether a load succeeds.
         self.observer = observer
@@ -118,9 +149,21 @@ class ResidencyArbiter:
         self.admission_timeout = admission_timeout
 
         self._residents: Dict[str, Resident] = {}
+        # Why the last admission attempt did not fit, so the eviction it causes
+        # says something more useful than "making room".
+        self._room_reason = "the card is full"
         self._loading: Optional[Loading] = None
         self._lock = asyncio.Lock()
         self._idle_task: Optional[asyncio.Task] = None
+
+    def use_budget(self, budget) -> None:
+        """Hand residency the broker's `budget()`.
+
+        Called after both objects exist, because the broker needs `loading`
+        from here and this needs the budget from there. One callable each way
+        rather than two modules importing one another.
+        """
+        self._budget = budget
 
     # ---- what is resident -----------------------------------------------------
 
@@ -128,39 +171,50 @@ class ResidencyArbiter:
     def residents(self) -> List[Resident]:
         return list(self._residents.values())
 
-    def _sole_resident(self) -> Optional[Resident]:
+    def _hot_resident(self) -> Optional[Resident]:
         """The resident to answer single-model questions with.
 
-        Admission is one, so "the" resident is well defined. When it opens, the
-        callers of this — `/api/ps`, the `auto` model sentinel — need a real
-        answer about *which* model, and this is where that lands. Until then,
-        most-recently-admitted is both correct and the whole set.
+        With admission open there is no "the" resident, so the honest answer to
+        "what is loaded" — for the `auto` sentinel, which wants to ride
+        whatever is already warm rather than force a swap — is the most
+        recently used one. Most-recently-*admitted* would send a side task to a
+        model that was admitted once and has been cold ever since.
         """
         residents = self.residents
-        return residents[-1] if residents else None
+        if not residents:
+            return None
+        return max(residents, key=lambda r: r.last_use)
 
     @property
     def current_tag(self) -> Optional[str]:
-        resident = self._sole_resident()
+        resident = self._hot_resident()
         return resident.tag if resident else None
 
     @property
     def current_spec(self) -> Optional[ModelSpec]:
-        """The ModelSpec currently loaded (running), or None when idle."""
-        resident = self._sole_resident()
+        """The most recently used running model, or None when idle."""
+        resident = self._hot_resident()
         if resident is not None and resident.backend.alive():
             return resident.spec
         return None
 
     @property
-    def upstream(self) -> str:
-        """Base URL of the loaded backend.
+    def current_specs(self) -> List[ModelSpec]:
+        """Every running model, hottest first. What `/api/ps` should report."""
+        return [
+            r.spec for r in sorted(self.residents, key=lambda r: -r.last_use)
+            if r.backend.alive()
+        ]
 
-        Backend-dependent: llama-server binds our fixed upstream port, a docker
-        model publishes its own. Falls back to the llama-server port when
-        nothing is loaded.
+    def upstream_for(self, tag: str) -> str:
+        """Base URL of the backend serving `tag`.
+
+        Per-tag and not a single `upstream` property, because with two
+        residents there is no single upstream and a global one would quietly
+        proxy every request to whichever model was admitted last — a wrong
+        answer that returns 200.
         """
-        resident = self._sole_resident()
+        resident = self._residents.get(tag)
         if resident is not None:
             return resident.backend.upstream
         return f"http://{self.host}:{self.port}"
@@ -230,7 +284,7 @@ class ResidencyArbiter:
                 resident = None
             if resident is None:
                 await self._make_room_for(spec)
-                resident = await self._start_resident(spec)
+                resident = await self._start_with_retry(spec)
             resident.inflight += 1
             resident.drained.clear()
             resident.last_use = time.monotonic()
@@ -240,11 +294,24 @@ class ResidencyArbiter:
     def release(self, tag: Optional[str] = None) -> None:
         """Mark one in-flight request complete; wake a waiting eviction at zero.
 
-        `tag` names the resident the request was acquired on. It is optional
-        only while admission is one — omitting it then is unambiguous. A caller
-        that knows its tag should pass it, and from Stage 6 must.
+        `tag` names the resident the request was acquired on, and now that more
+        than one model can be resident it is how the right counter gets
+        decremented. Omitting it is tolerated only when there is exactly one
+        resident to mean; with two it would decrement the wrong model's
+        counter, which reads as a leaked request and blocks that model's next
+        eviction until the drain times out.
         """
-        resident = self._residents.get(tag) if tag is not None else self._sole_resident()
+        if tag is not None:
+            resident = self._residents.get(tag)
+        elif len(self._residents) == 1:
+            resident = next(iter(self._residents.values()))
+        else:
+            if self._residents:
+                log.warning(
+                    "release() without a tag while %d models are resident — "
+                    "nothing released", len(self._residents),
+                )
+            return
         if resident is None:
             # The resident was force-evicted out from under a request that
             # overran the drain timeout. Nothing left to decrement.
@@ -299,10 +366,77 @@ class ResidencyArbiter:
     # ---- residency changes ----------------------------------------------------
 
     async def _make_room_for(self, spec: ModelSpec) -> None:
-        """Evict until `spec` can be admitted. Least recently used goes first."""
-        while len(self._residents) >= _ADMITTED_RESIDENTS:
-            victim = min(self._residents.values(), key=lambda r: r.last_use)
-            await self._evict(victim, incoming=spec)
+        """Evict until `spec` can be admitted. Least recently used goes first.
+
+        The loop is on *cost*, not on a count: the count ceiling is checked
+        first because it is cheap, and then every remaining pass asks the
+        budget whether the incoming model actually fits beside what is there.
+        """
+        reason = self._must_be_alone(spec)
+        while self._residents:
+            if reason is not None:
+                await self._evict_lru(spec, reason)
+                continue
+            if len(self._residents) >= self.max_residents:
+                await self._evict_lru(
+                    spec, f"the {self.max_residents}-resident ceiling is reached"
+                )
+                continue
+            fits = await self._fits_beside_residents(spec)
+            if fits is None:  # the card cannot be read — do not guess
+                await self._evict_lru(spec, "the card cannot be read")
+                continue
+            if fits:
+                return
+            await self._evict_lru(spec, self._room_reason)
+
+    def _must_be_alone(self, spec: ModelSpec) -> Optional[str]:
+        """Why `spec` cannot share the card, or None if it can.
+
+        Three ways to end up alone, and they are all the same decision made
+        from different evidence: it says so, a resident says so, or nobody
+        knows what it costs.
+        """
+        if spec.exclusive:
+            return f"{spec.tag} is exclusive"
+        for resident in self.residents:
+            if resident.spec.exclusive:
+                return f"{resident.tag} is exclusive"
+        if self._budget is None:
+            return "there is no budget to decide from"
+        if self._cost_mb(spec) is None:
+            return f"nothing has measured {spec.tag} yet"
+        return None
+
+    def _cost_mb(self, spec: ModelSpec) -> Optional[int]:
+        cache = getattr(self.observer, "cache", None)
+        return known_cost_mb(cache, spec)
+
+    async def _fits_beside_residents(self, spec: ModelSpec) -> Optional[bool]:
+        """Whether `spec` fits in what is currently free. None if unreadable.
+
+        `free_mb` is the broker's, so residents already on the card are
+        accounted for by what the device reports them using — this must never
+        become a sum of what vramux believes each resident costs, or the two
+        accountings drift and the untested one is the one that OOMs.
+        """
+        cost = self._cost_mb(spec)
+        if cost is None or self._budget is None:
+            return None
+        try:
+            budget = await self._budget()
+        except Exception as exc:
+            log.warning("could not read the budget for admission: %s", exc)
+            return None
+        self._room_reason = (
+            f"{spec.tag} needs {cost} MiB and {budget.free_mb} MiB is free"
+        )
+        return cost <= budget.free_mb
+
+    async def _evict_lru(self, incoming: ModelSpec, reason: str) -> None:
+        victim = min(self._residents.values(), key=lambda r: r.last_use)
+        log.info("making room for %s: %s", incoming.tag, reason)
+        await self._evict(victim, incoming=incoming)
 
     async def _evict(self, resident: Resident, *, incoming: Optional[ModelSpec] = None) -> None:
         """Drain this resident's own in-flight requests, then stop it."""
@@ -337,10 +471,30 @@ class ResidencyArbiter:
             await self._evict(resident)
             return True
 
-    def _make_backend(self, spec: ModelSpec) -> Backend:
+    def _make_backend(self, spec: ModelSpec, port: Optional[int]) -> Backend:
         if spec.kind == KIND_DOCKER:
             return DockerComposeBackend(spec)
-        return ProcessBackend(self.host, self.port)
+        return ProcessBackend(self.host, port)
+
+    def _take_port(self) -> int:
+        """Borrow an upstream port for a llama-server.
+
+        The pool is exhausted only if the resident count ceiling has already
+        been passed, which admission does not allow — but a pool that returns
+        a port already in use would bind-fail in a way that reads as a broken
+        model, so it raises instead.
+        """
+        if not self._free_ports:
+            raise RuntimeError("no free upstream port — every one is in use")
+        return self._free_ports.pop(0)
+
+    def _return_port(self, port: Optional[int]) -> None:
+        if port is None or port in self._free_ports:
+            return
+        # Ordered, so a restarted resident tends to land back on the same port
+        # and a stale stderr file is about the model it says it is about.
+        self._free_ports.append(port)
+        self._free_ports.sort()
 
     def _startup_budget(self, spec: ModelSpec) -> float:
         # A docker model can legitimately take minutes on a cold container;
@@ -349,9 +503,44 @@ class ResidencyArbiter:
             return max(self.startup_timeout, 600.0)
         return self.startup_timeout
 
+    async def _start_with_retry(self, spec: ModelSpec) -> Resident:
+        """Start `spec`, and if it fails beside peers, try once more alone.
+
+        Free memory is not always allocatable memory (`DESIGN.md` §11): the
+        allocator fragments, and admission can honestly say yes to a load that
+        then cannot place its weights. Alone, the same load usually succeeds,
+        so a request that would have failed gets served instead — at the cost
+        of the peers, which is the trade a swap always made anyway.
+
+        Exactly one retry. A load that fails on an empty card is failing for
+        its own reasons, and retrying that in a loop turns a broken model into
+        a hung request.
+        """
+        try:
+            return await self._start_resident(spec)
+        except Exception as exc:
+            peers = self.residents
+            if not peers:
+                raise
+            log.warning(
+                "%s failed to load beside %s (%s) — evicting and retrying alone",
+                spec.tag, ", ".join(r.tag for r in peers), exc,
+            )
+            for peer in peers:
+                await self._evict(peer, incoming=spec)
+            return await self._start_resident(spec)
+
     async def _start_resident(self, spec: ModelSpec) -> Resident:
-        backend = self._make_backend(spec)
-        resident = Resident(spec=spec, backend=backend)
+        # The port is taken here rather than inside `_make_backend` so that it
+        # is returned to the pool by the one place that knows the resident
+        # died — a backend that raises on the way up would otherwise keep it.
+        port = None if spec.kind == KIND_DOCKER else self._take_port()
+        try:
+            backend = self._make_backend(spec, port)
+        except Exception:
+            self._return_port(port)
+            raise
+        resident = Resident(spec=spec, backend=backend, port=port)
         self._residents[spec.tag] = resident
         budget = self._startup_budget(spec)
         self._loading = Loading(tag=spec.tag, started=time.monotonic(), budget=budget)
@@ -395,7 +584,11 @@ class ResidencyArbiter:
         try:
             await resident.backend.stop()
         finally:
+            # Both in a `finally`: a backend whose stop() raises still has to
+            # leave the bookkeeping clean, or a corpse holds a port and a slot
+            # forever and the next load fails for a reason nobody can see.
             self._residents.pop(tag, None)
+            self._return_port(resident.port)
         if self.observer is not None:
             self.observer.release(tag)
             await self.observer.observe_unload(tag, before)
@@ -414,13 +607,13 @@ class ResidencyArbiter:
     # ---- idle -----------------------------------------------------------------
 
     def touch(self) -> None:
-        resident = self._sole_resident()
+        resident = self._hot_resident()
         if resident is not None:
             resident.last_use = time.monotonic()
 
     def _effective_idle_timeout(self, resident: Optional[Resident] = None) -> float:
         if resident is None:
-            resident = self._sole_resident()
+            resident = self._hot_resident()
         if resident is not None and resident.spec.idle_timeout is not None:
             return resident.spec.idle_timeout
         return self.idle_timeout

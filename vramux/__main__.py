@@ -20,7 +20,7 @@ from .lease import DEFAULT_TTL, SAMPLE_INTERVAL, Broker, clamped_sample_interval
 from .observer import CostCache, Observer
 from .registry import ModelRegistry
 from .router import make_app
-from .residency import ResidencyArbiter
+from .residency import DEFAULT_MAX_RESIDENTS, ResidencyArbiter
 
 
 def _serve(args: argparse.Namespace) -> None:
@@ -34,6 +34,7 @@ def _serve(args: argparse.Namespace) -> None:
         port=args.upstream_port,
         idle_timeout=args.idle_timeout,
         observer=observer,
+        max_residents=args.max_residents,
     )
     # `loading` rather than the arbiter itself: the broker needs to know a load
     # is in flight — it has not allocated yet, so the card reads freer than it
@@ -44,6 +45,11 @@ def _serve(args: argparse.Namespace) -> None:
         loading=lambda: arbiter.loading,
         sample_interval=clamped_sample_interval(args.sample_interval),
     )
+    # The other half of the pair: residency decides room from the same budget
+    # the broker grants leases from. Injected after construction because each
+    # side needs one callable from the other and neither should import the
+    # other's module.
+    arbiter.use_budget(broker.budget)
     app = make_app(registry, arbiter, broker)
     web.run_app(app, host=args.host, port=args.port, print=None)
 
@@ -128,6 +134,9 @@ def main() -> None:
     parser.add_argument("--reserve-mb", type=int,
                         default=env.get_int("RESERVE_MB", DEFAULT_RESERVE_MB),
                         help="headroom held back from every grant")
+    parser.add_argument("--max-residents", type=int,
+                        default=env.get_int("MAX_RESIDENTS", DEFAULT_MAX_RESIDENTS),
+                        help="most models allowed resident at once")
     parser.add_argument("--sample-interval", type=float,
                         default=env.get_float("SAMPLE_INTERVAL", SAMPLE_INTERVAL),
                         help="seconds between usage-history samples")

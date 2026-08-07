@@ -84,6 +84,15 @@ models:
     # A container reload costs far more than a GGUF load, so evicting it on the
     # default schedule is a bad trade.
     idle_timeout: 3600
+    # What it costs on the card. A container's internals cannot be measured
+    # before it runs, and admission refuses to guess — without this the model
+    # is served alone until its first load measures it. A measurement always
+    # wins over this number.
+    vram_mb: 20000
+    # Set this on a model that wants the whole card. Admission then evicts
+    # every other resident for it and never admits anything beside it, which
+    # is cheaper than discovering the same fact through a failed load.
+    exclusive: true
     weights_dir: ~/models/some-model   # size reporting only
     quantization: W2
     family: some-model

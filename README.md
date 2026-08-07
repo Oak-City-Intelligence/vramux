@@ -9,8 +9,10 @@ clients keep working unchanged, and owns the question of what is resident:
 when a request arrives for a model that is not loaded, whatever is loaded comes
 down first.
 
-Today that means **one model resident at a time**, and two kinds of backend
-behind the same endpoint:
+More than one model may be resident when the card can prove it fits: admission
+compares a *measured* cost against the same budget leases are granted from, and
+a model nobody has measured is served alone. Two kinds of backend sit behind the
+same endpoint:
 
 | kind | what it runs | for |
 |---|---|---|
@@ -91,7 +93,7 @@ documents both backend kinds.
 |---|---|---|
 | `VRAMUX_HOST` | `127.0.0.1` | bind address |
 | `VRAMUX_PORT` | `11434` | ollama-compatible port |
-| `VRAMUX_UPSTREAM_PORT` | `18080` | port llama-server backends bind |
+| `VRAMUX_UPSTREAM_PORT` | `18080` | first port llama-server backends bind; one per resident, consecutive |
 | `VRAMUX_IDLE_TIMEOUT` | `900` | seconds before an idle model is unloaded |
 | `VRAMUX_MODEL_DIR` | `./models` | scanned for `*.gguf` |
 | `VRAMUX_MODELS_CONFIG` | `./models.yml` | registry file |
@@ -101,6 +103,7 @@ documents both backend kinds.
 | `VRAMUX_DEVICE` | `0` | GPU index to observe |
 | `VRAMUX_CACHE_DIR` | `~/.cache/vramux` | where measured costs and usage history are written |
 | `VRAMUX_RESERVE_MB` | `1024` | headroom held back from every lease |
+| `VRAMUX_MAX_RESIDENTS` | `2` | ceiling on models resident at once; the budget is the real limit |
 | `VRAMUX_SAMPLE_INTERVAL` | `300` | seconds between usage-history samples; clamped up to the 5 s lease sweep it rides on |
 
 The older `MYLLAMA_*` names still work, warning once each.
@@ -237,22 +240,26 @@ curl -s localhost:11434/api/chat -d '{
 that leases memory to any consumer on the machine, not just to model serving.
 Serving is its first client.
 
-Leases exist and the budget is honest about the card. What is still missing is
-the part that uses it: **one model is resident at a time**, and admission does
-not consult the budget to decide otherwise. Opening it needs a measurement
-dataset with real numbers in it, and that is deliberately gated — an
-underestimate is an OOM, and an OOM on a shared card can take the innocent
-resident down with it.
+Leases exist, the budget is honest about the card, and serving now draws on it:
+a second model is admitted when its measured cost fits in what is free, and a
+leaseholder taking memory is enough to keep it out. What is deliberately absent
+is estimation — a model with no measured or declared cost gets the card to
+itself, because an underestimate is an OOM and an OOM on a shared card can take
+the innocent resident down with it.
 
-Serving also does not take leases for its own residents yet. It does not need
-to: the budget is anchored on what the device reports, so a resident is
-accounted for whether or not anybody wrote it down.
+Serving does not take leases for its own residents. It does not need to: the
+budget is anchored on what the device reports, so a resident is accounted for
+whether or not anybody wrote it down.
+
+What is still missing is cooperative eviction — asking a leaseholder to yield.
+Today a lease is never revoked, so a big model waits for one to expire rather
+than negotiating.
 
 ## Contributing
 
 `CONTRIBUTING.md`, and `DESIGN.md` before it. The two arguments most worth
 reading first are why the budget is anchored on what the device reports, and
-why exactly one model is resident at a time.
+why admission refuses to estimate a cost it has not measured.
 
 ## License
 

@@ -121,14 +121,19 @@ class Router:
         return web.json_response({"version": "vramux-1"})
 
     async def ps(self, _request: web.Request) -> web.Response:
-        """Mimic ollama's `/api/ps` — what model (if any) is currently loaded."""
-        cur = self.arbiter.current_spec
-        if not cur:
-            return web.json_response({"models": []})
-        entry = cur.to_ollama_tag_entry()
-        entry["size_vram"] = entry["size"]
-        entry["expires_at"] = "0001-01-01T00:00:00Z"
-        return web.json_response({"models": [entry]})
+        """Mimic ollama's `/api/ps` — every model currently loaded.
+
+        A list because admission is no longer one: reporting only the hottest
+        resident would tell a client the card is free of a model that is very
+        much on it.
+        """
+        models = []
+        for spec in self.arbiter.current_specs:
+            entry = spec.to_ollama_tag_entry()
+            entry["size_vram"] = entry["size"]
+            entry["expires_at"] = "0001-01-01T00:00:00Z"
+            models.append(entry)
+        return web.json_response({"models": models})
 
     async def gpu_state(self, _request: web.Request) -> web.Response:
         """What is on the card right now, with ownership resolved.
@@ -288,7 +293,7 @@ class Router:
         if not spec:
             return web.json_response({"error": f"model '{model}' not found"}, status=404)
         if _is_unload_request(body):
-            return await self._handle_unload(model)
+            return await self._handle_unload(model, spec)
         try:
             await self.arbiter.acquire(spec)
         except BackendLoading as exc:
@@ -312,7 +317,7 @@ class Router:
             if tools:
                 upstream_payload["tools"] = tools
 
-            upstream_url = f"{self.arbiter.upstream}/v1/chat/completions"
+            upstream_url = f"{self.arbiter.upstream_for(spec.tag)}/v1/chat/completions"
             return await self._proxy_openai_chat(request, upstream_url, upstream_payload, spec.tag, stream)
         finally:
             self.arbiter.release(spec.tag)
@@ -324,7 +329,7 @@ class Router:
         if not spec:
             return web.json_response({"error": f"model '{model}' not found"}, status=404)
         if _is_unload_request(body):
-            return await self._handle_unload(model)
+            return await self._handle_unload(model, spec)
         try:
             await self.arbiter.acquire(spec)
         except BackendLoading as exc:
@@ -341,7 +346,7 @@ class Router:
             if want_json:
                 # /v1/completions doesn't accept response_format; constrain via GBNF.
                 upstream_payload["grammar"] = _JSON_GRAMMAR
-            upstream_url = f"{self.arbiter.upstream}/v1/completions"
+            upstream_url = f"{self.arbiter.upstream_for(spec.tag)}/v1/completions"
             return await self._proxy_openai_generate(
                 request, upstream_url, upstream_payload, spec.tag, stream, strip_thinking=want_json,
             )
@@ -362,7 +367,7 @@ class Router:
             inp = body.get("prompt") or body.get("input") or ""
             upstream_payload = {"model": spec.served_name, "input": inp}
             assert self._client_session is not None
-            async with self._client_session.post(f"{self.arbiter.upstream}/v1/embeddings", json=upstream_payload) as resp:
+            async with self._client_session.post(f"{self.arbiter.upstream_for(spec.tag)}/v1/embeddings", json=upstream_payload) as resp:
                 data = await resp.json()
             # ollama shape: {"embedding": [...]}  (single)  or {"embeddings": [[...]]}
             if isinstance(data.get("data"), list) and data["data"]:
@@ -372,9 +377,19 @@ class Router:
         finally:
             self.arbiter.release(spec.tag)
 
-    async def _handle_unload(self, model: str) -> web.Response:
-        """Unload the currently-loaded model. Returns ollama's shape."""
-        await self.arbiter.stop()
+    async def _handle_unload(self, model: str, spec=None) -> web.Response:
+        """Unload one model — ollama's `keep_alive: 0`. Returns ollama's shape.
+
+        Named, not "everything". With one resident the two were the same
+        thing; with two, tearing the card down because a client finished with
+        one of them takes the other model out from under whoever was using it.
+        A tag that is not resident is a no-op that still answers `done`, which
+        is what a client asking for memory it is not holding should hear.
+        """
+        if spec is None:
+            await self.arbiter.stop()
+        else:
+            await self.arbiter.evict(spec.tag)
         return web.json_response({
             "model": model,
             "created_at": _ts(),
@@ -398,7 +413,7 @@ class Router:
         try:
             body["model"] = spec.served_name
 
-            upstream_url = f"{self.arbiter.upstream}{request.path}"
+            upstream_url = f"{self.arbiter.upstream_for(spec.tag)}{request.path}"
             assert self._client_session is not None
             async with self._client_session.post(upstream_url, json=body) as upstream:
                 resp = web.StreamResponse(status=upstream.status, headers={"Content-Type": upstream.headers.get("Content-Type", "application/json")})

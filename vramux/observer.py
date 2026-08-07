@@ -90,6 +90,27 @@ def cost_key(spec) -> str:
     return hashlib.sha256("\x1f".join(parts).encode()).hexdigest()[:16]
 
 
+def known_cost_mb(cache, spec) -> Optional[int]:
+    """What this model costs, or `None` when nobody actually knows.
+
+    Two sources and no third one. A measurement of this exact configuration is
+    authoritative; a `vram_mb:` in config is the operator's word for backends
+    whose internals cannot be introspected. There is deliberately no estimate:
+    `DESIGN.md` §4.2 describes one, and an estimate is exactly what must not
+    decide whether a second model joins a card that is already holding one —
+    an underestimate is an OOM that takes the innocent resident with it. A
+    model with no known cost is served alone, which is what vramux did for its
+    whole life before this, and it becomes packable the first time it loads.
+    """
+    entry = cache.get(cost_key(spec)) if cache is not None else None
+    if entry and entry.get("measured_mb"):
+        return int(entry["measured_mb"])
+    declared = getattr(spec, "vram_mb", None)
+    if declared:
+        return int(declared)
+    return None
+
+
 @dataclass
 class Attribution:
     """One process, labelled with who vramux thinks it belongs to."""

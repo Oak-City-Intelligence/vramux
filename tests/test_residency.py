@@ -11,6 +11,8 @@ from typing import List, Optional
 
 import pytest
 
+from vramux.budget import Budget
+from vramux.observer import cost_key
 from vramux.registry import KIND_DOCKER, ModelSpec
 from vramux.residency import ResidencyArbiter
 
@@ -72,7 +74,7 @@ class FakeArbiter(ResidencyArbiter):
         self.start_delay = 0.0
         self.fail_next_start = False
 
-    def _make_backend(self, spec: ModelSpec) -> FakeBackend:
+    def _make_backend(self, spec: ModelSpec, port=None) -> FakeBackend:
         b = FakeBackend(spec, self, self.start_delay, self.fail_next_start)
         self.fail_next_start = False
         self.backends.append(b)
@@ -119,9 +121,11 @@ async def test_swap_stops_before_starting(sup):
 
 
 async def test_upstream_tracks_the_loaded_backend(sup):
-    assert sup.upstream == "http://127.0.0.1:18080"
+    assert sup.upstream_for("a:1b") == "http://127.0.0.1:18080"
     await sup.acquire(spec("a:1b"))
-    assert sup.upstream == "http://fake"
+    assert sup.upstream_for("a:1b") == "http://fake"
+    # an unknown tag falls back rather than borrowing another model's backend
+    assert sup.upstream_for("b:2b") == "http://127.0.0.1:18080"
 
 
 async def test_current_spec_is_none_when_nothing_loaded(sup):
@@ -373,7 +377,7 @@ async def test_a_backend_that_cannot_report_pids_still_loads():
 
     obs = RecordingObserver()
     sup = FakeArbiter(observer=obs)
-    sup._make_backend = lambda spec_: NoPids(spec_, sup)
+    sup._make_backend = lambda spec_, port=None: NoPids(spec_, sup)
     await sup.acquire(spec("d:35b", kind=KIND_DOCKER))
     assert sup.current_tag == "d:35b"
     assert obs.claims == [("d:35b", [])]
@@ -386,3 +390,209 @@ async def test_observation_is_optional():
     sup.release()
     await sup.stop()
     assert sup.events == ["start:a:1b", "stop:a:1b"]
+
+
+# ---- multi-residency ------------------------------------------------------
+#
+# The card is faked in one direction only: costs come from a stand-in cache and
+# free memory from a stand-in budget, so what is under test is the packing
+# decision and nothing about NVML.
+
+
+class FakeCache:
+    """Measured costs, by cost key. `record` is what a real load would do."""
+
+    def __init__(self, by_tag=None) -> None:
+        self.by_tag = dict(by_tag or {})
+
+    def get(self, key):
+        for tag, mb in self.by_tag.items():
+            if cost_key(ModelSpec(tag=tag)) == key:
+                return {"tag": tag, "measured_mb": mb}
+        return None
+
+    def all(self):
+        return {}
+
+
+class CostedObserver(RecordingObserver):
+    def __init__(self, costs=None) -> None:
+        super().__init__()
+        self.cache = FakeCache(costs)
+
+
+def packing_arbiter(costs=None, free_mb=20000, **kw) -> FakeArbiter:
+    """An arbiter that can pack: measured costs, and a card with room."""
+    sup = FakeArbiter(observer=CostedObserver(costs), **kw)
+    sup.free_mb = free_mb
+    sup.use_budget(lambda: _fake_budget(sup))
+    return sup
+
+
+async def _fake_budget(sup):
+    return Budget(
+        total_mb=24564, reserve_mb=1024,
+        used_mb=24564 - 1024 - sup.free_mb,
+        recognised_mb=0, foreign_mb=0, unattributed_mb=0,
+    )
+
+
+async def test_two_measured_models_are_resident_at_once():
+    """The stage, in one test: a second model joins instead of replacing."""
+    sup = packing_arbiter({"a:9b": 6591, "b:9b": 6195}, free_mb=20000)
+    await sup.acquire(spec("a:9b"))
+    sup.release("a:9b")
+    await sup.acquire(spec("b:9b"))
+    sup.release("b:9b")
+
+    assert sup.events == ["start:a:9b", "start:b:9b"], "nothing should have stopped"
+    assert sorted(r.tag for r in sup.residents) == ["a:9b", "b:9b"]
+
+
+async def test_a_model_nobody_has_measured_is_served_alone():
+    """No estimate anywhere in this path: an underestimate is an OOM that
+    takes the innocent resident with it."""
+    sup = packing_arbiter({"a:9b": 6591}, free_mb=20000)
+    await sup.acquire(spec("a:9b"))
+    sup.release("a:9b")
+    await sup.acquire(spec("unmeasured:12b"))
+    sup.release("unmeasured:12b")
+
+    assert sup.events == ["start:a:9b", "stop:a:9b", "start:unmeasured:12b"]
+
+
+async def test_a_declared_cost_is_enough_to_pack_a_container():
+    """A container's internals are not introspectable, so `vram_mb:` is the
+    operator's word for it — and it is enough."""
+    sup = packing_arbiter({"a:9b": 6591}, free_mb=20000)
+    await sup.acquire(spec("a:9b"))
+    sup.release("a:9b")
+    await sup.acquire(spec("c:7b", kind=KIND_DOCKER, vram_mb=5000))
+    sup.release("c:7b")
+
+    assert sup.events == ["start:a:9b", "start:c:7b"]
+
+
+async def test_a_second_model_that_does_not_fit_evicts_the_first():
+    sup = packing_arbiter({"a:9b": 6591, "big:27b": 18970}, free_mb=10000)
+    await sup.acquire(spec("a:9b"))
+    sup.release("a:9b")
+    await sup.acquire(spec("big:27b"))
+    sup.release("big:27b")
+
+    assert sup.events == ["start:a:9b", "stop:a:9b", "start:big:27b"]
+
+
+async def test_an_exclusive_model_takes_the_card_in_both_directions():
+    sup = packing_arbiter({"a:9b": 6591, "solo:35b": 6000}, free_mb=20000)
+    await sup.acquire(spec("a:9b"))
+    sup.release("a:9b")
+    # cheap enough to fit twice over, and still alone because it says so
+    await sup.acquire(spec("solo:35b", exclusive=True))
+    sup.release("solo:35b")
+    assert sup.events == ["start:a:9b", "stop:a:9b", "start:solo:35b"]
+    # and nothing joins it either
+    await sup.acquire(spec("a:9b"))
+    sup.release("a:9b")
+    assert sup.events[-2:] == ["stop:solo:35b", "start:a:9b"]
+
+
+async def test_the_resident_ceiling_holds_even_when_everything_fits():
+    sup = packing_arbiter(
+        {"a:9b": 100, "b:9b": 100, "c:9b": 100}, free_mb=20000, max_residents=2,
+    )
+    for tag in ("a:9b", "b:9b", "c:9b"):
+        await sup.acquire(spec(tag))
+        sup.release(tag)
+    assert len(sup.residents) == 2
+    assert "stop:a:9b" in sup.events, "the least recently used goes first"
+
+
+async def test_a_load_that_fails_beside_a_peer_retries_alone():
+    """Free memory is not always allocatable memory. Admission can honestly
+    say yes to a load that then cannot place its weights."""
+    sup = packing_arbiter({"a:9b": 6591, "b:9b": 6195}, free_mb=20000)
+    await sup.acquire(spec("a:9b"))
+    sup.release("a:9b")
+
+    started = {"n": 0}
+    real_make = sup._make_backend
+
+    def flaky(spec_, port=None):
+        started["n"] += 1
+        backend = real_make(spec_, port)
+        backend.fail = started["n"] == 1 and spec_.tag == "b:9b"
+        return backend
+
+    sup._make_backend = flaky
+    await sup.acquire(spec("b:9b"))
+    sup.release("b:9b")
+
+    assert sup.events == [
+        "start:a:9b", "start-failed:b:9b", "stop:a:9b", "start:b:9b",
+    ]
+    assert [r.tag for r in sup.residents] == ["b:9b"]
+
+
+async def test_a_load_that_fails_alone_is_not_retried():
+    """A load failing on an empty card is failing for its own reasons, and
+    retrying that in a loop turns a broken model into a hung request."""
+    sup = packing_arbiter({"a:9b": 6591})
+    sup.fail_next_start = True
+    with pytest.raises(RuntimeError):
+        await sup.acquire(spec("a:9b"))
+    assert sup.events == ["start-failed:a:9b"]
+
+
+async def test_each_resident_gets_its_own_upstream_port():
+    """Two llama-servers cannot share one port, and a global upstream would
+    proxy every request to whichever model was admitted last."""
+    sup = packing_arbiter({"a:9b": 100, "b:9b": 100}, free_mb=20000)
+    await sup.acquire(spec("a:9b"))
+    sup.release("a:9b")
+    await sup.acquire(spec("b:9b"))
+    sup.release("b:9b")
+
+    ports = sorted(r.port for r in sup.residents)
+    assert ports == [18080, 18081]
+
+    await sup.evict("a:9b")
+    # the freed port goes back to the pool rather than being burned
+    await sup.acquire(spec("a:9b"))
+    sup.release("a:9b")
+    assert sorted(r.port for r in sup.residents) == [18080, 18081]
+
+
+async def test_a_container_takes_no_port_from_the_pool():
+    sup = packing_arbiter({"c:7b": 100, "a:9b": 100}, free_mb=20000)
+    sup._make_backend = lambda spec_, port=None: FakeBackend(spec_, sup)
+    await sup.acquire(spec("c:7b", kind=KIND_DOCKER, vram_mb=100))
+    sup.release("c:7b")
+    assert sup.residents[0].port is None
+
+
+async def test_auto_follows_the_hottest_resident_not_the_newest():
+    """`auto` exists so a side task rides whatever is already warm. With two
+    residents, most-recently-*admitted* would send it to the cold one."""
+    sup = packing_arbiter({"a:9b": 100, "b:9b": 100}, free_mb=20000)
+    await sup.acquire(spec("a:9b"))
+    sup.release("a:9b")
+    await sup.acquire(spec("b:9b"))
+    sup.release("b:9b")
+    assert sup.current_tag == "b:9b"
+
+    await sup.acquire(spec("a:9b"))  # a is used again; b goes cold
+    sup.release("a:9b")
+    assert sup.current_tag == "a:9b"
+    assert len(sup.residents) == 2, "using a warm resident must not swap anything"
+
+
+async def test_release_without_a_tag_is_refused_when_it_is_ambiguous():
+    sup = packing_arbiter({"a:9b": 100, "b:9b": 100}, free_mb=20000)
+    await sup.acquire(spec("a:9b"))
+    sup.release()  # unambiguous: one resident
+    await sup.acquire(spec("b:9b"))
+    sup.release()  # ambiguous: decrementing the wrong counter blocks a drain
+    assert [r.inflight for r in sup.residents] == [0, 1]
+    sup.release("b:9b")
+    assert [r.inflight for r in sup.residents] == [0, 0]

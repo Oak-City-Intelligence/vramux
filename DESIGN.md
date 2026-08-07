@@ -445,9 +445,17 @@ de-personalize. GPU-less test suite. This ships and is safe.
 Lease API, TTL, renewal, CLI wrapper. Migrate the batch pipeline and the
 `vram-free` helper, which is where the value first shows up outside this repo.
 
-**v0.3 — real mux.**
+**v0.3 — real mux.** *Landed 2026-08-07.*
 Measure-and-learn feeding admission. Multi-resident, port pool, LRU eviction,
 `exclusive`. The budget opens only once the cost cache has real numbers in it.
+
+One thing was decided during the build and is not in §4.2's three-source
+ladder: **admission uses measured and declared costs only, never an estimate.**
+An estimate is good enough to size a card, and not good enough to decide
+whether a second model joins one that is already loaded — the failure mode is
+§11's first risk, and it kills the innocent resident as well as the greedy one.
+A model with no known cost is served alone, which is what vramux did for its
+whole life before this, and it becomes packable the moment it loads.
 
 The ordering is deliberate: the structure that makes multi-residency possible
 lands in v0.1, but the budget stays closed until v0.3 has measurements to open it
