@@ -101,6 +101,7 @@ documents both backend kinds.
 | `VRAMUX_DEVICE` | `0` | GPU index to observe |
 | `VRAMUX_CACHE_DIR` | `~/.cache/vramux` | where measured costs and usage history are written |
 | `VRAMUX_RESERVE_MB` | `1024` | headroom held back from every lease |
+| `VRAMUX_SAMPLE_INTERVAL` | `300` | seconds between usage-history samples; clamped up to the 5 s lease sweep it rides on |
 
 The older `MYLLAMA_*` names still work, warning once each.
 

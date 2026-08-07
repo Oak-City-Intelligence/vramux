@@ -146,7 +146,7 @@ class Router:
         leases = []
         budget = None
         if self.broker is not None:
-            leases = [lease.to_json() for lease in self.broker.leases]
+            leases = await self.broker.views(snap)
             budget = (await self.broker.budget(snap)).to_json()
         return web.json_response({
             "device": {
@@ -208,7 +208,7 @@ class Router:
             return _lease_error(exc)
         except (TypeError, ValueError) as exc:
             return web.json_response({"error": str(exc)}, status=400)
-        return web.json_response(lease.to_json())
+        return web.json_response(await self.broker.view(lease))
 
     async def lease_release(self, request: web.Request) -> web.Response:
         if self.broker is None:
@@ -232,12 +232,15 @@ class Router:
             lease = await self.broker.renew(request.match_info["lease_id"], ttl)
         except LeaseError as exc:
             return _lease_error(exc)
-        return web.json_response(lease.to_json())
+        return web.json_response(await self.broker.view(lease))
 
     async def lease_list(self, _request: web.Request) -> web.Response:
         if self.broker is None:
             return web.json_response({"error": "leasing disabled"}, status=503)
-        return web.json_response({"leases": [l.to_json() for l in self.broker.leases]})
+        try:
+            return web.json_response({"leases": await self.broker.views()})
+        except LeaseError as exc:
+            return _lease_error(exc)
 
     async def evict(self, request: web.Request) -> web.Response:
         """Drop a named resident by hand. Idle models unload themselves; this

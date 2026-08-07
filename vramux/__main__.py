@@ -16,7 +16,7 @@ from aiohttp import web
 
 from . import cli, env
 from .budget import DEFAULT_RESERVE_MB
-from .lease import DEFAULT_TTL, Broker
+from .lease import DEFAULT_TTL, SAMPLE_INTERVAL, Broker, clamped_sample_interval
 from .observer import CostCache, Observer
 from .registry import ModelRegistry
 from .router import make_app
@@ -42,6 +42,7 @@ def _serve(args: argparse.Namespace) -> None:
         observer,
         reserve_mb=args.reserve_mb,
         loading=lambda: arbiter.loading,
+        sample_interval=clamped_sample_interval(args.sample_interval),
     )
     app = make_app(registry, arbiter, broker)
     web.run_app(app, host=args.host, port=args.port, print=None)
@@ -127,6 +128,9 @@ def main() -> None:
     parser.add_argument("--reserve-mb", type=int,
                         default=env.get_int("RESERVE_MB", DEFAULT_RESERVE_MB),
                         help="headroom held back from every grant")
+    parser.add_argument("--sample-interval", type=float,
+                        default=env.get_float("SAMPLE_INTERVAL", SAMPLE_INTERVAL),
+                        help="seconds between usage-history samples")
     sub = parser.add_subparsers(dest="subcommand")
     sub.add_parser("serve", help="run the router (the default)")
     sub.add_parser("state", help="print what is on the GPU and exit")

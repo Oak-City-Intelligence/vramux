@@ -54,6 +54,13 @@ SWEEP_INTERVAL = 5.0
 # How often the same timer records what the card looked like. The observer has
 # always logged foreign usage and never stored it, so drift over time was
 # unrecoverable; one timer, two jobs.
+#
+# Five minutes is a history of drift, not a history of events: a measured batch
+# run took the card to within 1 627 MiB of full during a stage that lasted 14
+# seconds, and at this default the history cannot see that stage at all. Hence
+# `VRAMUX_SAMPLE_INTERVAL` — and hence `clamped_sample_interval()`, because the
+# sample only fires on a sweep tick and asking for finer than `SWEEP_INTERVAL`
+# buys nothing.
 SAMPLE_INTERVAL = 300.0
 
 # Cadence for re-testing the budget while a request waits for room.
@@ -154,10 +161,13 @@ class Lease:
     expires_at: float = 0.0
     granted_iso: str = ""
     expires_iso: str = ""
-    # What the holder was already holding when the grant was made. Kept for
-    # reporting: a grant of 18 GB that charged 0 is not a bug, and the log
-    # line should be able to say so.
-    covered_mb: int = 0
+    # What the holder was already holding *at the moment of the grant*. Kept
+    # for reporting: a grant of 18 GB that charged 0 is not a bug, and the log
+    # line should be able to say so. It is a snapshot and never moves again —
+    # a holder that leases before it allocates records 0 here for its whole
+    # life. What it is holding *now* is `observed_mb`, which only the broker
+    # can answer because only the broker reads the card.
+    covered_at_grant_mb: int = 0
 
     def expired(self, now: float) -> bool:
         return now >= self.expires_at
@@ -166,6 +176,11 @@ class Lease:
         return max(0.0, now - self.granted_at)
 
     def to_json(self) -> dict:
+        """Everything about this lease that does not require reading the card.
+
+        Live coverage is deliberately absent: `Broker.view()` adds it, from the
+        same accounting the budget is computed with.
+        """
         return {
             "lease": self.id,
             "owner": self.owner,
@@ -175,8 +190,40 @@ class Lease:
             "pids": list(self.pids),
             "granted_at": self.granted_iso,
             "expires_at": self.expires_iso,
-            "covered_mb": self.covered_mb,
+            "covered_at_grant_mb": self.covered_at_grant_mb,
         }
+
+
+def clamped_sample_interval(seconds: float, sweep: float = SWEEP_INTERVAL) -> float:
+    """The finest sampling cadence that is actually deliverable, saying so.
+
+    The sampler rides the sweep timer, so a request for anything below the
+    sweep interval cannot be honoured — and silently keeping the number would
+    leave a history that claims a resolution it never had.
+    """
+    if seconds < sweep:
+        log.warning(
+            "sample interval %.1fs is below the %.1fs sweep it rides on — "
+            "sampling every %.1fs instead",
+            seconds, sweep, sweep,
+        )
+        return sweep
+    return seconds
+
+
+def _with_account(lease: Lease, account: Optional[LeaseAccount]) -> dict:
+    """A lease's JSON, plus what its holder currently has on the card.
+
+    `observed_mb` climbs from 0 to the grant as the holder allocates, and
+    `outstanding_mb` falls to 0 as it does — the same pair the budget subtracts.
+    A console reads these; `covered_at_grant_mb` is history, not state.
+    """
+    payload = lease.to_json()
+    if account is None:  # released between listing and accounting
+        account = LeaseAccount(id=lease.id, owner=lease.owner, granted_mb=lease.mb)
+    payload["observed_mb"] = account.observed_mb
+    payload["outstanding_mb"] = account.outstanding_mb
+    return payload
 
 
 class Broker:
@@ -242,15 +289,53 @@ class Broker:
         return budget_mod.compute(snapshot, self._accounts(snapshot), self.reserve_mb)
 
     def _accounts(self, snapshot) -> List[LeaseAccount]:
-        return [
-            LeaseAccount(
-                id=lease.id,
-                owner=lease.owner,
-                granted_mb=lease.mb,
-                observed_mb=self._observed_for(snapshot, lease.pids),
+        return [self._account_for(lease, snapshot) for lease in self._leases.values()]
+
+    def _account_for(self, lease: "Lease", snapshot) -> LeaseAccount:
+        return LeaseAccount(
+            id=lease.id,
+            owner=lease.owner,
+            granted_mb=lease.mb,
+            observed_mb=self._observed_for(snapshot, lease.pids),
+        )
+
+    async def views(self, snapshot=None) -> List[dict]:
+        """Every lease as JSON, with what its holder is holding *now*.
+
+        `observed_mb` and `outstanding_mb` come from `_accounts()` — the same
+        list `budget()` is computed from — rather than being worked out a
+        second time here. Two accountings of the same memory drift, and only
+        one of them ends up tested; that is the failure `budget.py`'s docstring
+        is written against.
+        """
+        if snapshot is None:
+            snapshot = await self.observer.snapshot()
+        if snapshot is None:
+            raise CardUnreadable("the GPU cannot be read")
+        accounts = {account.id: account for account in self._accounts(snapshot)}
+        return [_with_account(lease, accounts.get(lease.id)) for lease in self.leases]
+
+    async def view(self, lease: "Lease", snapshot=None) -> dict:
+        """One lease as JSON, with live coverage.
+
+        Falls back to the grant-time snapshot when the card cannot be read: a
+        holder that has just been granted memory should get its lease id back,
+        not a 503 about a field. The shape stays the same either way.
+        """
+        if snapshot is None:
+            try:
+                snapshot = await self.observer.snapshot()
+            except Exception:
+                snapshot = None
+        if snapshot is None:
+            return _with_account(
+                lease,
+                LeaseAccount(
+                    id=lease.id, owner=lease.owner, granted_mb=lease.mb,
+                    observed_mb=lease.covered_at_grant_mb,
+                ),
             )
-            for lease in self._leases.values()
-        ]
+        return _with_account(lease, self._account_for(lease, snapshot))
 
     def _observed_for(self, snapshot, pids: Sequence[int]) -> int:
         return budget_mod.observed_mb(
@@ -353,7 +438,7 @@ class Broker:
             expires_at=now + ttl,
             granted_iso=_iso(0),
             expires_iso=_iso(ttl),
-            covered_mb=min(observed, mb),
+            covered_at_grant_mb=min(observed, mb),
         )
         self._leases[lease.id] = lease
         if charge < mb:

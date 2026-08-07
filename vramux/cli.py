@@ -212,8 +212,12 @@ def leases(args) -> int:
     if not rows:
         print("no leases held")
         return 0
-    print(f"  {'MiB':>7}  {'PRI':>3}  {'EXPIRES':<26} OWNER")
+    # HELD is what the holder actually has on the card right now. A grant with
+    # HELD far below MiB is a holder that has not allocated yet — which is the
+    # correct order to do it in, so it is normal early and suspicious late.
+    print(f"  {'MiB':>7}  {'HELD':>7}  {'PRI':>3}  {'EXPIRES':<26} OWNER")
     for row in sorted(rows, key=lambda r: -r["granted_mb"]):
-        print(f"  {row['granted_mb']:>7}  {row['priority']:>3}  "
+        print(f"  {row['granted_mb']:>7}  {row.get('observed_mb', 0):>7}  "
+              f"{row['priority']:>3}  "
               f"{row['expires_at']:<26} {row['owner']}  ({row['lease']})")
     return 0

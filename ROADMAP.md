@@ -400,12 +400,20 @@ grants tracked, `outstanding` fell to zero as each holder allocated, the card
 returned exactly to its starting numbers on release, and a request larger than
 the card failed 413 immediately rather than waiting out its timeout.
 
-One reporting defect surfaced and is worth fixing before Stage 7 draws a
-console from these numbers: **`covered_mb` in `/gpu/state` is a grant-time
-snapshot**, so a holder that leases before it allocates reports `covered_mb: 0`
-forever, even while the budget correctly sees its memory. The arithmetic is
-right and the field is misleading. Either rename it for what it is or report
-live coverage beside it.
+One reporting defect surfaced and has been fixed: `covered_mb` was a
+grant-time snapshot, so a holder that leases before it allocates — the correct
+order — reported `covered_mb: 0` for its whole life while the budget correctly
+saw its memory. The arithmetic was right and the field was misleading. It is
+now `covered_at_grant_mb`, which says what it is, and every lease payload
+carries live `observed_mb` and `outstanding_mb` beside it, taken from the same
+accounting `budget.py` computes from rather than worked out a second time. A
+console can draw from those.
+
+The other thing that run argued for landed with it: `VRAMUX_SAMPLE_INTERVAL`.
+The history sampled every five minutes, and a measured batch run took the card
+to within 1 627 MiB of full during a stage that lasted fourteen seconds — an
+event the history could not see at all. The knob clamps up to the 5 s lease
+sweep it rides on, and says so when it does.
 
 ## Stage 7 — The console
 

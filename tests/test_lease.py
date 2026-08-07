@@ -151,9 +151,43 @@ async def test_re_acquiring_memory_already_held_charges_nothing_new():
 
     lease = await b.acquire(mb=18000, owner="image-stack", ttl=60, pids=[4127])
 
-    assert lease.covered_mb == 18000
+    assert lease.covered_at_grant_mb == 18000
     after = await b.budget()
     assert after.free_mb == before.free_mb  # the lease covers, it does not add
+
+
+def test_a_sampling_cadence_finer_than_the_sweep_is_clamped(caplog):
+    """The sample fires on a sweep tick, so `VRAMUX_SAMPLE_INTERVAL=1` would
+    otherwise record a history claiming a resolution it never had."""
+    with caplog.at_level(logging.WARNING):
+        assert lease_mod.clamped_sample_interval(1.0, sweep=5.0) == 5.0
+    assert "below the 5.0s sweep" in caplog.text
+    assert lease_mod.clamped_sample_interval(30.0, sweep=5.0) == 30.0
+
+
+async def test_a_lease_reports_what_its_holder_holds_now_not_at_grant_time():
+    """The correct order is lease first, allocate second — and that is exactly
+    the holder whose grant-time snapshot is 0 forever. What a console draws has
+    to move as the holder allocates, or it reports an idle lease over 2 GB of
+    real memory."""
+    observer = FakeObserver(snapshot(used=1000))
+    b = broker(observer)
+    lease = await b.acquire(mb=2000, owner="stills", ttl=60, pids=[4127])
+
+    at_grant = (await b.views())[0]
+    assert at_grant["covered_at_grant_mb"] == 0
+    assert at_grant["observed_mb"] == 0
+    assert at_grant["outstanding_mb"] == 2000
+
+    observer.snap = snapshot(used=3000, procs=[GpuProcess(4127, 2000, "worker")])
+
+    now = (await b.views())[0]
+    assert now["covered_at_grant_mb"] == 0  # history, and it stays history
+    assert now["observed_mb"] == 2000
+    assert now["outstanding_mb"] == 0
+    # the same numbers the budget subtracts, not a second accounting
+    account = next(a for a in (await b.budget()).leases if a.id == lease.id)
+    assert (account.observed_mb, account.outstanding_mb) == (2000, 0)
 
 
 async def test_a_holder_asking_for_more_than_it_holds_pays_the_difference():
@@ -339,9 +373,12 @@ async def test_lease_endpoints_round_trip(client):
     assert resp.status == 200
     lease = await resp.json()
     assert lease["granted_mb"] == 8000
+    # every lease payload carries live coverage, whichever endpoint returned it
+    assert (lease["observed_mb"], lease["outstanding_mb"]) == (0, 8000)
 
     listed = await (await client.get("/gpu/lease")).json()
     assert [l["lease"] for l in listed["leases"]] == [lease["lease"]]
+    assert listed["leases"][0]["outstanding_mb"] == 8000
 
     renewed = await client.post(f"/gpu/lease/{lease['lease']}/renew", json={"ttl": 120})
     assert renewed.status == 200
