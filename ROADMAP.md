@@ -357,6 +357,36 @@ Stage 6.
 
 **Needs a free GPU and the Stage 2 dataset. Do not start it without both.**
 
+The dataset is closed as of 2026-08-07: every registered tag has a measured
+cost, taken one at a time on an otherwise idle card.
+
+Model tags on this machine are private, so the table is by shape. The point is
+the spread, not the catalogue:
+
+| params | ctx | measured |
+|---|---|---|
+| 35B | 16384 | 21 405 MiB |
+| 27B | 65536 | 18 970 MiB |
+| 35B | 131072 | 18 916 MiB |
+| 14B | 81920 | 18 635 MiB |
+| 27B | 16384 | 17 555 MiB |
+| 12B | 81920 | 10 993 MiB |
+| 9B | 98304 | 9 231 MiB |
+| 9B | 16384 | 6 591 MiB |
+| 9B | 4096 | 6 195 MiB |
+
+**Context dominates, not parameter count.** A 14B at 81 920 tokens costs 18 635
+MiB — more than a 27B at 16 384 — and the same 9B weights span 6 195 to 9 231
+MiB across three windows. Admission cannot reason about a model; it has to
+reason about a model *at a context*, which is what the cost cache is keyed on
+and why raising `_ADMITTED_RESIDENTS` from a parameter count would be wrong.
+
+Against the 23 540 MiB ceiling that gives six admissible pairs, all of them
+drawn from the four cheapest entries: 6 195 + 6 591, 6 195 + 9 231, 6 591 +
+9 231, 6 195 + 10 993, 6 591 + 10 993, and 9 231 + 10 993 at 20 224 MiB, which
+is the tightest of them. Everything from 17 555 upward is a single-resident
+model on this card, and `exclusive: true` is the honest way to say so.
+
 - Measure-and-learn feeding admission, replacing estimates with recorded costs.
 - Port pool, so more than one local backend can run.
 - LRU eviction under pressure; `exclusive: true` for models that want the card.
