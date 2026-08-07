@@ -368,6 +368,45 @@ context are roughly 17 GB resident together and genuinely fit on a 24 GB card.
 
 **Exit:** two models resident and serving. No OOM across a week of normal use.
 
+### What normal use actually looks like, and why it will not test this
+
+A full batch-pipeline run was measured end to end at one sample per second. It
+peaked at **22 937 MiB of a 24 564 MiB card** — one consumer, 93% of the card,
+climbing 15 GB in seconds as it moved between a language model and a diffusion
+stage. The card was never shared during it, because nothing was left to share.
+
+That is worth stating plainly: **the workload this machine runs today gains
+nothing from multi-residency.** Packing helps traffic made of several modest
+consumers, and the daily traffic here is one large one. The stage is aimed at
+the shape the machine should be able to run, not the shape it currently does.
+
+The consequence is that normal use will never exercise this. The scenario has
+to be built deliberately, and both halves of it exist:
+
+- **Two residents, no downloads.** The registry's smallest model at a small
+  context is 6 195 MiB (measured); the same weights at 16K are 6 591 MiB.
+  Registered as separate tags, that is 12 786 MiB resident together, which
+  fits with room to spare. Same weights on disk, two genuine residents, and
+  it works only once `_make_room_for()` evicts on cost rather than on count.
+- **Several claimants at once.** `tools/hold_vram.py` allocates real VRAM
+  through the driver and holds it, optionally under a lease with its own owner
+  and renewal loop. `tools/scenario_small_loads.sh` runs several at staggered
+  arrivals and checks the budget through the whole cycle. This is the part
+  serving cannot test: many holders, arrivals interleaved with allocations,
+  and reclaim when a holder dies without cleanup.
+
+Both were used to check the Stage 4 accounting under four concurrent holders:
+grants tracked, `outstanding` fell to zero as each holder allocated, the card
+returned exactly to its starting numbers on release, and a request larger than
+the card failed 413 immediately rather than waiting out its timeout.
+
+One reporting defect surfaced and is worth fixing before Stage 7 draws a
+console from these numbers: **`covered_mb` in `/gpu/state` is a grant-time
+snapshot**, so a holder that leases before it allocates reports `covered_mb: 0`
+forever, even while the budget correctly sees its memory. The arithmetic is
+right and the field is misleading. Either rename it for what it is or report
+live coverage beside it.
+
 ## Stage 7 — The console
 
 Only now, and only because everything under it is real.
