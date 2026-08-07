@@ -189,7 +189,7 @@ async def test_release_never_goes_negative(sup):
 
 
 async def test_wedged_backend_is_recycled_on_next_acquire(sup):
-    """The container-model failure mode: process/container still up, /health 503, and
+    """The observed failure mode: process/container still up, /health 503, and
     every request fed to it hangs forever. Reusing it is worse than a restart."""
     a = spec("a:1b")
     await sup.acquire(a)

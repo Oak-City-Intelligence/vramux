@@ -84,8 +84,7 @@ class ModelSpec:
       subprocess the supervisor spawns.
     * ``docker`` — an already-built compose service that exposes an
       OpenAI-compatible server on ``port``. Used for models llama.cpp cannot
-      load at all (e.g. the the container model ``vendor-quant`` 2-bit quant, which needs its own
-      CUDA kernels). The supervisor brings the container up and down exactly as
+      load at all — say a 2-bit vendor quant that needs its own CUDA kernels. The supervisor brings the container up and down exactly as
       it starts and stops a llama-server, so both kinds compete for the single
       GPU slot under the same swap and idle-unload rules.
     """

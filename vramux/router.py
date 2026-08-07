@@ -66,14 +66,14 @@ class Router:
         return web.json_response({"models": models})
 
     async def models(self, _request: web.Request) -> web.Response:
-        """OpenAI-compatible `/v1/models` — lets clients (a client) verify the
-        endpoint and enumerate available models. ollama exposes this too."""
+        """OpenAI-compatible `/v1/models` — lets a client verify the endpoint and
+        enumerate available models. ollama exposes this too."""
         data = [
             {"id": spec.tag, "object": "model", "created": 0, "owned_by": "vramux"}
             for spec in self.registry.all()
         ]
         # Synthetic "auto" id: resolves to whatever model is currently loaded.
-        # Lets side-task callers (a client auxiliary tasks) target the live model
+        # Lets side-task callers (auxiliary agent tasks) target the live model
         # without forcing a swap, and keeps endpoint-verification probes happy.
         data.append({"id": "auto", "object": "model", "created": 0, "owned_by": "vramux"})
         return web.json_response({"object": "list", "data": data})
@@ -341,8 +341,8 @@ def _strip_thinking(text: str) -> str:
 
 def _is_unload_request(body: Dict[str, Any]) -> bool:
     """ollama convention: `keep_alive: 0` with empty prompt/messages means
-    'unload the model now'. the batch pipeline uses this between pipeline stages
-    to free VRAM for other GPU work."""
+    'unload the model now'. A batch pipeline uses this between stages to hand
+    the card to other GPU work."""
     keep_alive = body.get("keep_alive", None)
     if keep_alive in (0, "0", "0s"):
         prompt_empty = not body.get("prompt") and not body.get("messages")

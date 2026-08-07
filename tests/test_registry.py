@@ -33,9 +33,9 @@ def test_loads_both_kinds(isolated_registry, tmp_path):
         "container-model:35b": {
             "kind": "docker",
             "compose_file": str(tmp_path / "docker-compose.yml"),
-            "compose_service": "container-model",
+            "compose_service": "runtime",
             "port": 30000,
-            "served_name": "container-model/Qwen3.6-35B",
+            "served_name": "vendor/Some-35B",
             "ctx": 131072,
             "idle_timeout": 3600,
         },
@@ -49,10 +49,10 @@ def test_loads_both_kinds(isolated_registry, tmp_path):
 
     doc = reg.get("container-model:35b")
     assert doc.kind == KIND_DOCKER
-    assert doc.port == 30000 and doc.compose_service == "container-model"
+    assert doc.port == 30000 and doc.compose_service == "runtime"
     assert doc.idle_timeout == 3600.0
     # A docker backend answers to its own baked-in id, not our tag.
-    assert doc.served_name == "container-model/Qwen3.6-35B"
+    assert doc.served_name == "vendor/Some-35B"
 
 
 def test_docker_entry_without_served_name_falls_back_to_tag(isolated_registry, tmp_path):
@@ -202,7 +202,7 @@ def test_tag_entry_reports_size_and_format_per_kind(isolated_registry, tmp_path)
     cfg = write_yaml(tmp_path / "models.yml", {
         "q:9b": {"gguf": str(blob), "family": "qwen"},
         "d:35b": {"kind": "docker", "compose_file": str(tmp_path / "c.yml"), "port": 1,
-                  "weights_dir": str(weights), "quantization": "vendor-quant-2bit"},
+                  "weights_dir": str(weights), "quantization": "vendor-2bit"},
     })
     reg = ModelRegistry(config_file=cfg, model_dir=tmp_path / "nope")
     entries = {s.tag: s.to_ollama_tag_entry() for s in reg.all()}
@@ -211,7 +211,7 @@ def test_tag_entry_reports_size_and_format_per_kind(isolated_registry, tmp_path)
     # A docker model has no single blob to stat; size comes from the weights dir.
     assert entries["d:35b"]["size"] == 99
     assert entries["d:35b"]["details"]["format"] == "docker"
-    assert entries["d:35b"]["details"]["quantization_level"] == "vendor-quant-2bit"
+    assert entries["d:35b"]["details"]["quantization_level"] == "vendor-2bit"
 
 
 def test_size_is_zero_when_weights_are_absent():

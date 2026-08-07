@@ -369,7 +369,7 @@ class LlamaServerSupervisor:
                 and self._current is spec
             )
             # "Running" is not "working". A backend can wedge with its process
-            # or container still up — the container-model server does exactly this if its
+            # or container still up — one container backend does exactly this if its
             # detokenizer stalls, answering /health with 503 while accepting
             # requests that never return. Reusing it would feed every later
             # request into a black hole, so verify health and recycle if red.
