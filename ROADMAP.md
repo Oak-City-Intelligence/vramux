@@ -43,9 +43,14 @@ These constrain every stage. They are why the ordering looks conservative.
 
 ## Current state (2026-08-07)
 
-**Stages 0 to 3 are done.** Stage 4, leases, is next.
+**Stages 0 to 4 are done.** Stage 5, migrating clients, is next — and most of
+it is work in other repos.
 
-- ~2,600 lines across nine modules; 119 tests, all GPU-less
+- ~3,400 lines across twelve modules; 171 tests, all GPU-less
+- the broker grants: leases with mandatory TTL, server-side expiry, reclaim by
+  process tree, and `vramux lease -- <cmd>` holding one for a command's lifetime
+- nothing requires a grant to be served: unmigrated consumers are foreign,
+  which is a correct state
 - residency-shaped arbiter with per-resident in-flight counting; admission is
   pinned at one, so behaviour is still one model at a time
 - swap verified working both directions against the live service after the
@@ -241,6 +246,60 @@ state, not a broken one.
 
 **Exit:** a lease can be taken and released by hand, survives a broker restart
 without corrupting the budget, and expires loudly when its holder dies.
+
+### Done, 2026-08-07
+
+Two new modules, kept flat rather than split into the `core/ lease/` directories
+`DESIGN.md` §8 eventually wants: `budget.py` is pure arithmetic over one reading
+and the current grants, `lease.py` is the broker — grants, expiry, and the pid
+attribution behind reclaim.
+
+The decision worth recording is **what the budget is anchored on**. Summing what
+vramux believes it handed out would have needed a separate rule for residents,
+for leaseholders, for foreign processes and for driver overhead, and any one of
+them wrong is an OOM. Instead:
+
+```
+free = total - reserve - used - outstanding
+```
+
+`used` is what the device reports, which already contains all four populations.
+`outstanding` is the part of each grant its holder has not allocated yet,
+`max(0, granted - observed)`. Reclaim then needs no special case at all: a
+holder whose memory is already on the card is already inside `used`, so its
+grant charges nothing new, and as it allocates, the same memory simply moves
+from promised to present. That was verified against the live card — a 6000 MiB
+grant naming a resident already holding 6588 MiB moved free memory by zero.
+
+Three things the stage learned that were not in the plan:
+
+- **Attribution has to follow the process tree.** The wrapper acquires the
+  lease and then runs a command, so the process that allocates is a child or a
+  grandchild. Matching the exact pid would have left the holder's own memory
+  reading as foreign — which is the double-count the stage exists to prevent,
+  arriving through the front door instead of after a restart.
+- **Nothing may be granted while a model is loading.** A load in flight has not
+  allocated yet, so the card reads freer than it is about to be. The request
+  waits and gets an honest `408`.
+- **`reserve` is not the unattributed overhead already on the card.** That is
+  inside `used` and needs no help. The reserve covers what a *new* allocation
+  creates and never declares: its own CUDA context and compute buffers. It is
+  `VRAMUX_RESERVE_MB`, defaulting to 1024.
+
+The CLI is stdlib-only, deliberately — a client that needs a virtualenv to
+release a lease will not be installed on the machine that needs it. Expiry was
+built and tested before the wrapper, because a wrapper killed with `SIGKILL`
+runs no cleanup and server-side expiry is the only thing that makes the
+guarantee real.
+
+The stage also closed the standing gap from Stage 2: the sweep timer's second
+job records the card to `~/.cache/vramux/usage.jsonl`, so foreign drift over
+time is readable rather than merely logged.
+
+52 new tests, 171 total, still GPU-less and ~0.9 s. Verified against the live
+service: `413` immediately versus `408` after a wait, expiry logging loudly
+under a dead holder, reclaim against a real resident, grants refused during a
+cold container load, and the wrapper propagating its child's exit code.
 
 ## Stage 5 — Clients
 

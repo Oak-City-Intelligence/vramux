@@ -45,6 +45,9 @@ things to know before running it:
 - a wedged backend (process up, `/health` red) is recycled rather than reused
 - a container left running by a previous process is stopped at startup
 - `GET /gpu/state` — what is resident, what is foreign, what each model cost
+- `POST /gpu/lease`, `DELETE /gpu/lease/{id}`, `POST /gpu/lease/{id}/renew` —
+  memory reserved for consumers vramux does not run
+- `POST /gpu/evict` — unload a named resident by hand
 
 ## Install
 
@@ -84,7 +87,8 @@ documents both backend kinds.
 | `VRAMUX_UPSTREAM_READ_TIMEOUT` | `300` | seconds of upstream silence before erroring |
 | `VRAMUX_LOG_LEVEL` | `INFO` | python logging level |
 | `VRAMUX_DEVICE` | `0` | GPU index to observe |
-| `VRAMUX_CACHE_DIR` | `~/.cache/vramux` | where measured costs are written |
+| `VRAMUX_CACHE_DIR` | `~/.cache/vramux` | where measured costs and usage history are written |
+| `VRAMUX_RESERVE_MB` | `1024` | headroom held back from every lease |
 
 The older `MYLLAMA_*` names still work, warning once each.
 
@@ -128,6 +132,52 @@ Nothing reads those numbers to make a decision yet. That is deliberate: the
 cost model is the largest OOM risk in the design, and it should be answering
 from real measurements before anything depends on it.
 
+What the card looked like is also sampled on a timer into
+`~/.cache/vramux/usage.jsonl`, bounded and appended one JSON object per line,
+so foreign usage over time can be read back rather than scrolled past.
+
+## Leases
+
+A lease reserves VRAM for something vramux does not run — an image stack, a
+training script, a batch job. vramux does not start it, stop it or reach into
+it. It only promises that the memory stays available, and refuses to promise
+the same memory to anybody else.
+
+```bash
+vramux lease --mb 18000 --owner batch-pipeline -- ./stage2.sh
+```
+
+Acquire, run, renew in the background, release on the way out. That is the
+whole adoption story: the correct version has to be shorter than the poll loop
+it replaces.
+
+```bash
+vramux leases          # what is held right now
+vramux free --mb 8000  # wait until 8 GB could be granted, then exit
+vramux evict some:tag  # unload a resident model by hand
+```
+
+The rules worth knowing before writing a client:
+
+- **TTL is mandatory and there is no infinite lease.** Renewal is a heartbeat.
+  A holder killed with `SIGKILL` runs no cleanup by definition, so server-side
+  expiry — not the wrapper — is what stops a dead holder stranding the card.
+  Expiry logs loudly: a lease that expires under a live holder is a bug in that
+  holder.
+- **`413` and `408` mean different things.** `413` is "more than this card can
+  ever provide", which is a configuration error and fails immediately. `408` is
+  "not within the time you gave me", after actually waiting.
+- **Send your `pid`.** A holder that already has memory on the card — because
+  it allocated before asking, or because vramux restarted underneath it — is
+  charged only for the shortfall. Attribution follows the process tree, so the
+  command a wrapper runs counts as the wrapper.
+- **A restart drops every lease and frees nothing.** Holders demote to foreign:
+  vramux stops knowing whose memory that is, still sees it, and still subtracts
+  it. The budget stays true, which is the invariant that matters.
+
+Nothing needs a lease to be served a model. Consumers that have not migrated
+are foreign, which is a correct state and not a broken one.
+
 ## Layout
 
 ```
@@ -135,7 +185,10 @@ vramux/
   __main__.py     entry point — `python -m vramux`
   env.py          settings, with the old variable names shimmed
   nvml.py         reading the device — totals and per-process usage
-  observer.py     attribution, measurement, the cost cache
+  observer.py     attribution, measurement, the cost cache, usage history
+  budget.py       how much there is to hand out — pure arithmetic
+  lease.py        the broker: grants, expiry, reclaim by process tree
+  cli.py          the client side — `lease`, `free`, `evict`, stdlib only
   registry.py     ModelSpec, YAML config, dir scan, ollama-blob discovery
   backends.py     the Backend contract: ProcessBackend + DockerComposeBackend
   residency.py    who is on the card: admission, eviction, drain, idle
@@ -167,5 +220,15 @@ curl -s localhost:11434/api/chat -d '{
 
 `DESIGN.md` and `ROADMAP.md` describe the actual destination: a VRAM broker
 that leases memory to any consumer on the machine, not just to model serving.
-Serving is its first client. Multi-residency, leases and eviction are not
-implemented yet.
+Serving is its first client.
+
+Leases exist and the budget is honest about the card. What is still missing is
+the part that uses it: **one model is resident at a time**, and admission does
+not consult the budget to decide otherwise. Opening it needs a measurement
+dataset with real numbers in it, and that is deliberately gated — an
+underestimate is an OOM, and an OOM on a shared card can take the innocent
+resident down with it.
+
+Serving also does not take leases for its own residents yet. It does not need
+to: the budget is anchored on what the device reports, so a resident is
+accounted for whether or not anybody wrote it down.
