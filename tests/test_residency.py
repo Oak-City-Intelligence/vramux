@@ -150,6 +150,30 @@ async def test_stop_unloads(sup):
     assert sup.events == ["start:a:1b", "stop:a:1b"]
 
 
+async def test_evict_by_name_unloads_that_resident(sup):
+    await sup.acquire(spec("a:1b"))
+    sup.release()
+    assert await sup.evict("a:1b") is True
+    assert sup.current_spec is None
+    assert sup.events == ["start:a:1b", "stop:a:1b"]
+
+
+async def test_evicting_something_not_resident_reports_it_rather_than_raising(sup):
+    assert await sup.evict("nothing:9b") is False
+
+
+async def test_evict_by_name_drains_first(sup):
+    """A hand-evicted model must not kill a stream in progress either."""
+    a = spec("a:1b")
+    await sup.acquire(a)  # one request in flight, never released
+    task = asyncio.create_task(sup.evict("a:1b"))
+    await asyncio.sleep(0.05)
+    assert sup.current_spec is a, "eviction must wait for the drain"
+    sup.release()
+    assert await asyncio.wait_for(task, timeout=1) is True
+    assert sup.current_spec is None
+
+
 # ---- drain ----------------------------------------------------------------
 
 

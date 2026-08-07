@@ -18,6 +18,16 @@ import aiohttp
 from aiohttp import web
 
 from . import env
+from .lease import (
+    DEFAULT_TTL,
+    Broker,
+    CardUnreadable,
+    InvalidRequest,
+    LeaseError,
+    NoRoom,
+    NotGrantable,
+    UnknownLease,
+)
 from .registry import ModelRegistry
 from .residency import BackendLoading, ResidencyArbiter
 from .translate import (
@@ -41,9 +51,15 @@ UPSTREAM_READ_TIMEOUT = env.get_float("UPSTREAM_READ_TIMEOUT", 300.0)
 
 
 class Router:
-    def __init__(self, registry: ModelRegistry, arbiter: ResidencyArbiter) -> None:
+    def __init__(
+        self,
+        registry: ModelRegistry,
+        arbiter: ResidencyArbiter,
+        broker: Optional[Broker] = None,
+    ) -> None:
         self.registry = registry
         self.arbiter = arbiter
+        self.broker = broker
         self._client_session: Optional[aiohttp.ClientSession] = None
 
     async def startup(self, _app: web.Application) -> None:
@@ -54,10 +70,15 @@ class Router:
             timeout=aiohttp.ClientTimeout(total=None, sock_connect=10, sock_read=UPSTREAM_READ_TIMEOUT)
         )
         await self.arbiter.reconcile(self.registry.all())
+        if self.broker is not None:
+            # Expiry only becomes a guarantee once something is sweeping.
+            self.broker.start()
 
     async def cleanup(self, _app: web.Application) -> None:
         if self._client_session:
             await self._client_session.close()
+        if self.broker is not None:
+            await self.broker.close()
         await self.arbiter.stop()
 
     # ---- ollama API surface ---------------------------------------------------
@@ -122,6 +143,11 @@ class Router:
         snap = await observer.snapshot()
         if snap is None:
             return web.json_response({"error": "no GPU visible"}, status=503)
+        leases = []
+        budget = None
+        if self.broker is not None:
+            leases = [lease.to_json() for lease in self.broker.leases]
+            budget = (await self.broker.budget(snap)).to_json()
         return web.json_response({
             "device": {
                 "index": snap.device.index,
@@ -144,7 +170,89 @@ class Router:
             # rather than as a card that has stopped answering.
             "loading": self.arbiter.loading,
             "costs": observer.cache.all(),
+            # Grants outstanding, and the arithmetic behind them. Residents are
+            # accounted for by what the device reports them using, not by a
+            # lease — nothing requires a grant to serve a model yet.
+            "leases": leases,
+            "budget": budget,
         })
+
+    # ---- leases ---------------------------------------------------------------
+
+    async def lease_acquire(self, request: web.Request) -> web.Response:
+        """Grant memory, or say honestly why not.
+
+        `413` is "never, on this card" and `408` is "not within the time you
+        gave me". Conflating them would make a misconfigured request wait two
+        minutes before failing the way it was always going to.
+        """
+        if self.broker is None:
+            return web.json_response({"error": "leasing disabled"}, status=503)
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "body must be JSON"}, status=400)
+        pids = body.get("pids") or []
+        if body.get("pid") is not None:
+            pids = [body["pid"], *pids]
+        try:
+            lease = await self.broker.acquire(
+                mb=body.get("mb"),
+                owner=body.get("owner", ""),
+                ttl=body.get("ttl", DEFAULT_TTL),
+                priority=int(body.get("priority", 5)),
+                pids=pids,
+                wait=float(body.get("wait", 0) or 0),
+            )
+        except LeaseError as exc:
+            return _lease_error(exc)
+        except (TypeError, ValueError) as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        return web.json_response(lease.to_json())
+
+    async def lease_release(self, request: web.Request) -> web.Response:
+        if self.broker is None:
+            return web.json_response({"error": "leasing disabled"}, status=503)
+        try:
+            lease = await self.broker.release(request.match_info["lease_id"])
+        except LeaseError as exc:
+            return _lease_error(exc)
+        return web.json_response({"lease": lease.id, "released": True})
+
+    async def lease_renew(self, request: web.Request) -> web.Response:
+        if self.broker is None:
+            return web.json_response({"error": "leasing disabled"}, status=503)
+        ttl = None
+        if request.can_read_body:
+            try:
+                ttl = (await request.json()).get("ttl")
+            except Exception:
+                ttl = None
+        try:
+            lease = await self.broker.renew(request.match_info["lease_id"], ttl)
+        except LeaseError as exc:
+            return _lease_error(exc)
+        return web.json_response(lease.to_json())
+
+    async def lease_list(self, _request: web.Request) -> web.Response:
+        if self.broker is None:
+            return web.json_response({"error": "leasing disabled"}, status=503)
+        return web.json_response({"leases": [l.to_json() for l in self.broker.leases]})
+
+    async def evict(self, request: web.Request) -> web.Response:
+        """Drop a named resident by hand. Idle models unload themselves; this
+        is for the times you want the card back now."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "body must be JSON"}, status=400)
+        tag = body.get("tag") or ""
+        if not tag:
+            return web.json_response({"error": "tag is required"}, status=400)
+        evicted = await self.arbiter.evict(tag)
+        if not evicted:
+            return web.json_response({"error": f"{tag} is not resident"}, status=404)
+        return web.json_response({"tag": tag, "evicted": True})
 
     async def pull(self, _request: web.Request) -> web.Response:
         # Models are managed out-of-band (GGUFs are local files). No-op success.
@@ -368,9 +476,29 @@ def _still_loading(exc: BackendLoading) -> web.Response:
     )
 
 
-def make_app(registry: ModelRegistry, arbiter: ResidencyArbiter) -> web.Application:
+_LEASE_STATUS = {
+    InvalidRequest: 400,
+    UnknownLease: 404,
+    NoRoom: 408,
+    NotGrantable: 413,
+    CardUnreadable: 503,
+}
+
+
+def _lease_error(exc: LeaseError) -> web.Response:
+    status = _LEASE_STATUS.get(type(exc), 400)
+    if status >= 500 or status == 408:
+        log.warning("lease request refused (%d): %s", status, exc)
+    return web.json_response({"error": str(exc)}, status=status)
+
+
+def make_app(
+    registry: ModelRegistry,
+    arbiter: ResidencyArbiter,
+    broker: Optional[Broker] = None,
+) -> web.Application:
     app = web.Application(client_max_size=64 * 1024 * 1024)
-    r = Router(registry, arbiter)
+    r = Router(registry, arbiter, broker)
     app.on_startup.append(r.startup)
     app.on_cleanup.append(r.cleanup)
     app.router.add_get("/", r.health)
@@ -378,6 +506,11 @@ def make_app(registry: ModelRegistry, arbiter: ResidencyArbiter) -> web.Applicat
     app.router.add_get("/api/tags", r.list_tags)
     app.router.add_get("/api/ps", r.ps)
     app.router.add_get("/gpu/state", r.gpu_state)
+    app.router.add_get("/gpu/lease", r.lease_list)
+    app.router.add_post("/gpu/lease", r.lease_acquire)
+    app.router.add_delete("/gpu/lease/{lease_id}", r.lease_release)
+    app.router.add_post("/gpu/lease/{lease_id}/renew", r.lease_renew)
+    app.router.add_post("/gpu/evict", r.evict)
     app.router.add_post("/api/show", r.show)
     app.router.add_post("/api/chat", r.chat)
     app.router.add_post("/api/generate", r.generate)

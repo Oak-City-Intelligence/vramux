@@ -318,8 +318,24 @@ class ResidencyArbiter:
                     "drain timed out after %.0fs with %d in-flight; forcing swap",
                     self.drain_timeout, resident.inflight,
                 )
-        log.info("swapping model: %s -> %s", resident.tag, incoming.tag if incoming else "-")
+        if incoming is None:
+            log.info("evicting %s", resident.tag)
+        else:
+            log.info("swapping model: %s -> %s", resident.tag, incoming.tag)
         await self._stop_resident(resident)
+
+    async def evict(self, tag: str) -> bool:
+        """Drop one resident by name. False when it was not resident.
+
+        Goes through the same drain as an eviction made to fit something else,
+        so a hand-evicted model does not kill a stream in progress either.
+        """
+        async with self._lock:
+            resident = self._residents.get(tag)
+            if resident is None:
+                return False
+            await self._evict(resident)
+            return True
 
     def _make_backend(self, spec: ModelSpec) -> Backend:
         if spec.kind == KIND_DOCKER:

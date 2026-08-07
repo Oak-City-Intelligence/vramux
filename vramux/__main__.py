@@ -13,6 +13,8 @@ import sys
 from aiohttp import web
 
 from . import env
+from .budget import DEFAULT_RESERVE_MB
+from .lease import Broker
 from .observer import CostCache, Observer
 from .registry import ModelRegistry
 from .router import make_app
@@ -25,12 +27,21 @@ def _serve(args: argparse.Namespace) -> None:
         format="%(asctime)s %(levelname)s %(name)s :: %(message)s",
     )
     registry = ModelRegistry()
+    observer = Observer(device_index=args.device)
     arbiter = ResidencyArbiter(
         port=args.upstream_port,
         idle_timeout=args.idle_timeout,
-        observer=Observer(device_index=args.device),
+        observer=observer,
     )
-    app = make_app(registry, arbiter)
+    # `loading` rather than the arbiter itself: the broker needs to know a load
+    # is in flight — it has not allocated yet, so the card reads freer than it
+    # is about to be — and needs nothing else from residency.
+    broker = Broker(
+        observer,
+        reserve_mb=args.reserve_mb,
+        loading=lambda: arbiter.loading,
+    )
+    app = make_app(registry, arbiter, broker)
     web.run_app(app, host=args.host, port=args.port, print=None)
 
 
@@ -111,9 +122,13 @@ def main() -> None:
     parser.add_argument("--upstream-port", type=int, default=env.get_int("UPSTREAM_PORT", 18080))
     parser.add_argument("--idle-timeout", type=float, default=env.get_float("IDLE_TIMEOUT", 900))
     parser.add_argument("--log-level", default=env.get("LOG_LEVEL", "INFO"))
+    parser.add_argument("--reserve-mb", type=int,
+                        default=env.get_int("RESERVE_MB", DEFAULT_RESERVE_MB),
+                        help="headroom held back from every grant")
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("serve", help="run the router (the default)")
     sub.add_parser("state", help="print what is on the GPU and exit")
+
     args = parser.parse_args()
 
     if args.command == "state":
