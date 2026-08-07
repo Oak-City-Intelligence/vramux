@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# This machine's actual model catalogue — absolute paths, local tags.
+# `models.example.yml` is what ships.
+models.yml
+
+# Local performance notes, not part of the published project.
+baseline-*.md
