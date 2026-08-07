@@ -9,3 +9,8 @@ models.yml
 
 # Local performance notes, not part of the published project.
 baseline-*.md
+
+# Internal working notes: machine-specific narrative, credential locations,
+# and the names of other projects on this box. Kept on disk, never shipped.
+HANDOFF.md
+CAPTAINS_LOG.md

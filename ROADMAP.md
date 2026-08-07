@@ -1,7 +1,7 @@
-# llama-router → vramux
+# Roadmap
 
-How to get from a single-slot model router to the control console this machine
-was always supposed to have, without breaking the machine on the way.
+How to get from a single-slot model router to a real VRAM broker, without
+breaking the machine it runs on along the way.
 
 Companion to `DESIGN.md` (what vramux is). This is the sequence.
 
@@ -9,26 +9,18 @@ Companion to `DESIGN.md` (what vramux is). This is the sequence.
 
 ## The diagnosis
 
-The control console was attempted once. Its remains are still on disk:
-
-```
-May 26 17:05  a local tool the captioning tool the image stack a local tool the TTS tool    ← console, set up in one sitting
-Jun 16 15:51  vram-free                                   ← three weeks later
-```
-
-`<console-dir>` is referenced by four READMEs and no longer
-exists. The launchers survived; the directory that was supposed to unify them
-did not.
+A unifying control console for the machine's GPU tools was attempted once, and
+abandoned. The individual launchers survived it; the layer that was supposed to
+unify them did not.
 
 It did not fail for lack of ability. It failed because **it was a launcher layer
-with nothing underneath it.** Every `my*` tool knows how to start its workload.
+with nothing underneath it.** Each tool knows how to start its own workload.
 None of them can know whether starting it is *safe*, because no component owns
-that question. `vram-free` is the console discovering its own missing floor, and
-`the batch pipeline`'s poll loop and `the captioning tool`'s `the GPU advisor` are two more
-independent discoveries of the same hole.
+that question. Three separate tools have since grown their own VRAM-polling
+workaround — the same hole, discovered independently three times.
 
 So the sequence below does not rebuild the console. It builds the floor, then
-lets the existing tools stand on it. The `my*` family is the client set, not the
+lets the existing tools stand on it. Those tools are the client set, not the
 thing being replaced.
 
 ## Principles
@@ -36,8 +28,8 @@ thing being replaced.
 These constrain every stage. They are why the ordering looks conservative.
 
 1. **The daily driver never breaks.** The router on :11434 is load-bearing —
-   a client, an editor client, the captioning tool, the batch pipeline, a dependent project all depend on it. Every
-   stage ends with a working router or it is not finished.
+   every local-LLM client on the machine depends on it. Every stage ends with a
+   working router or it is not finished.
 2. **Each stage is independently valuable.** No stage exists only to enable the
    next one. If work stops after any stage, what shipped was worth shipping.
 3. **Each stage is reversible.** Until clients migrate, vramux's new behaviour
@@ -56,13 +48,13 @@ These constrain every stage. They are why the ordering looks conservative.
 - ~1,450 lines across five modules; 81 tests, all GPU-less
 - single slot, one backend at a time, swap verified working both directions
   (17 s cold container, 7 s container→GGUF, 16 s back)
-- lives at `<final-location>/`, under git, and serves `:11434`
-  from there as `vramux.service` (`the old unit` kept as an alias)
+- under git at its final location, serving `:11434` from there as
+  `vramux.service` (the old unit name kept as an alias)
 - no path resolves to this machine; a clean checkout with an empty environment
   starts and serves
 - `VRAMUX_*` env prefix; the old `MYLLAMA_*` names shim with a one-time warning
-- the training run has finished, so the GPU is free — Stage 6 is unblocked
-  whenever the Stage 2 dataset justifies starting it
+- the GPU is free again — Stage 6 is unblocked whenever the Stage 2 dataset
+  justifies starting it
 
 ---
 
@@ -96,12 +88,12 @@ health recycle (1), the drain wait (1), and `reconcile()`'s docker filter (1).
 
 ### 1a. Move, do not fork
 
-The repo relocates to `<final-location>/` **now**, early, and
-development continues there against the live service.
+The repo relocates to its final location **now**, early, and development
+continues there against the live service.
 
-The tempting alternative is to copy the code to `oci-public`, build vramux there
-while `llama-router` keeps serving :11434, and swap at the end. Do not do this.
-It produces two codebases, and:
+The tempting alternative is to copy the code somewhere clean, build vramux
+there while the old router keeps serving :11434, and swap at the end. Do not do
+this. It produces two codebases, and:
 
 - **Nothing is dogfooded.** The version under development is not the version
   running, so bugs are found by inspection instead of by use.
@@ -109,8 +101,8 @@ It produces two codebases, and:
   the fork or silently lost.
 - **All risk concentrates at cutover** — every bug from every stage arriving at
   once, on the day load-bearing infrastructure is swapped.
-- **The machine gets nothing until the end.** Stages 2, 4 and 5 each pay off on
-  this box immediately; a fork defers all of it.
+- **The machine gets nothing until the end.** Stages 2, 4 and 5 each pay off
+  immediately; a fork defers all of it.
 
 The thing that motivates forking — wanting a clean room for the scrub — is not
 worth it. The scrub is five hardcoded paths and an env prefix.
@@ -125,7 +117,7 @@ It lives at its final address from day one and is the thing actually running the
 whole time. There is never a moment where it gets "turned around and installed" —
 it was never anywhere else.
 
-Match how `talkrec` and `tmux-kit` wire into `oci-public/.githooks/`.
+Match how the neighbouring repos wire into the shared git hooks.
 
 ### 1b. Identity
 
@@ -133,10 +125,10 @@ Mechanical, low risk, and it stops the old name from spreading into new code.
 
 - `MYLLAMA_*` → `VRAMUX_*`, with a shim that reads the old names and warns.
 - `the old unit` → `vramux.service`.
-- Strip `<home>` and `<data-mount>` defaults: resolve the inference binary from
+- Strip absolute machine-specific defaults: resolve the inference binary from
   `$PATH`, model dir from env or `./models`, blob roots only if they exist.
 - `ctx_overrides` moves out of `registry.py` into shipped example config — it is
-  this box's configuration wearing a module as a disguise.
+  one machine's configuration wearing a module as a disguise.
 - `models.yml` stays local and gitignored; `models.example.yml` ships.
 
 Port 11434 does not change, so every client is unaffected. The unit file is the
@@ -152,8 +144,8 @@ a path under `/home`.
 
 Met. A fresh clone started under `env -i` with a foreign `HOME`, no config and
 no model directory: it came up and served `/api/tags` as an empty list rather
-than failing. No tracked source, test or config file mentions `<home>` or
-`<data-mount>`.
+than failing. No tracked file contains an absolute path to the machine it was
+written on.
 
 ## Stage 2 — The observer
 
@@ -173,8 +165,8 @@ Two reasons this comes before anything that uses it:
   the single largest OOM risk in `DESIGN.md`; this is how that risk gets retired
   before it is load-bearing.
 
-It also starts recording the training run currently holding 12 GB, which is
-exactly the tier-3 case that has to work.
+A foreign trainer holding a large slice of the card is exactly the tier-3 case
+that has to work, and it is the observer's most useful first subject.
 
 **Exit:** `vramux state` prints a true picture of the card, including processes
 vramux has never heard of. Cost cache has real entries for every model that has
@@ -226,18 +218,18 @@ and each one is the first time a real person gets a real benefit.
 
 | order | client | what changes | why this order |
 |---|---|---|---|
-| 1 | `the batch pipeline` | poll loop → `vramux lease -- ./stage2.sh` | worst hack, clearest win, easy rollback |
-| 2 | `the print pipeline` | `vram-free` deleted or reduced to `vramux free` | proves the primitive replaces the workaround |
-| 3 | `the image stack` | leaseholder; yields via its unload endpoint | first cooperative yielder, first container PID attribution test |
-| 4 | `the captioning tool` | drop `the GPU advisor`, ask the broker | removes the third reimplementation |
+| 1 | batch pipeline | poll loop → `vramux lease -- ./stage2.sh` | worst hack, clearest win, easy rollback |
+| 2 | `vram-free` helper | deleted or reduced to `vramux free` | proves the primitive replaces the workaround |
+| 3 | image stack | leaseholder; yields via its unload endpoint | first cooperative yielder, first container PID attribution test |
+| 4 | captioning tool | drop the GPU advisor, ask the broker | removes the third reimplementation |
 
 Stage 5 is where the untested assumption in `DESIGN.md` §13 gets tested — whether
 NVML attributes container processes to host PIDs the way reclaim needs. Client 3
 is deliberately the one that proves it, with clients 1 and 2 already delivering
 value if it turns out to be harder than expected.
 
-**Exit:** no project on this box reimplements VRAM reasoning. `vram-free` and
-`the GPU advisor` are gone.
+**Exit:** no project on the machine reimplements VRAM reasoning. The
+`vram-free` helper and the GPU advisor are gone.
 
 ## Stage 6 — Multi-residency
 
@@ -248,9 +240,9 @@ value if it turns out to be harder than expected.
 - LRU eviction under pressure; `exclusive: true` for models that want the card.
 - Budget opens.
 
-The first real win is the small one: an embedding model resident alongside a chat
-model, so a 512 MB request stops evicting 20 GB. On this box `qwen3.5:9b` plus
-`gemma4-coder:12b` is roughly 17 GB resident together and genuinely fits.
+The first real win is the small one: an embedding model resident alongside a
+chat model, so a 512 MB request stops evicting 20 GB. A 9B and a 12B at working
+context are roughly 17 GB resident together and genuinely fit on a 24 GB card.
 
 **Exit:** two models resident and serving. No OOM across a week of normal use.
 
@@ -258,16 +250,17 @@ model, so a 512 MB request stops evicting 20 GB. On this box `qwen3.5:9b` plus
 
 Only now, and only because everything under it is real.
 
-`vramux top` — live view of the card: what is resident, who holds leases, what is
-foreign, what is queued and waiting. The thing that was wanted at OS install.
+`vramux top` — live view of the card: what is resident, who holds leases, what
+is foreign, what is queued and waiting. The thing that was wanted at the start.
 
-The `my*` tools stay exactly as they are. They gain a floor, not a rewrite.
+The existing tools stay exactly as they are. They gain a floor, not a rewrite.
 
 ---
 
-## Working around the GPU
+## Working around a busy GPU
 
-The card is busy with training. That constrains *nothing* important:
+For most of this work the card was occupied by a training run. That constrains
+*nothing* important:
 
 | stage | needs GPU? |
 |---|---|
@@ -282,7 +275,8 @@ The card is busy with training. That constrains *nothing* important:
 
 Six of eight stages are GPU-free. Stage 6 is the only one that must wait, and it
 is the one that most wants the measurement history Stage 2 will have collected by
-then. The training run is not a delay; it is the observer's first subject.
+then. A long-running foreign job is not a delay; it is the observer's first
+subject.
 
 ## Risk register
 
@@ -299,10 +293,10 @@ then. The training run is not a delay; it is the observer's first subject.
 
 - Name `vramux`, verified unclaimed on PyPI, GitHub, npm
 - One repo: broker core, serving layer as its first client
-- Move to `<final-location>/` early; develop live, never fork
+- Move to the final location early; develop live, never fork
 - Leases dropped on broker restart; holders demote to foreign
 - Publishing is a side effect of good hygiene, not a driver, and has no deadline
-- The `my*` tools are clients, not migration targets
+- The machine's existing GPU tools are clients, not migration targets
 
 ## Open
 

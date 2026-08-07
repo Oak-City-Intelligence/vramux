@@ -5,17 +5,18 @@ wants a piece of it: language models, image models, TTS, trainers, and whatever
 else is on the box. Serving language models is the first thing built on top of
 it, not the point of it.
 
-Status: design. Nothing here is implemented yet. Supersedes the single-slot
-model-router framing in `HANDOFF.md`.
+Status: design. Most of this is not implemented yet; `ROADMAP.md` is the
+sequence and records what is done. Supersedes the single-slot model-router
+framing this project started from.
 
 ---
 
 ## 1. Why
 
-One 24 GB card, many consumers, no coordinator. Today every consumer on this
-box solves that alone, and each one solves it wrong.
+One 24 GB card, many consumers, no coordinator. Today every consumer on the
+machine solves that alone, and each one solves it wrong.
 
-`a batch pipeline script` — evict, poll, give up:
+A batch pipeline's unload helper — evict, poll, give up:
 
 ```bash
 ollama_unload(){
@@ -28,29 +29,29 @@ ollama_unload(){
 }
 ```
 
-`a `vram-free` helper` — a shell script that stops the image stack, unloads
-the language model, and prints VRAM before and after.
+A hand-written `vram-free` script — stops the image stack, unloads the language
+model, and prints VRAM before and after.
 
-`a GPU advisor module` — a third one, which at least
-knows what it is up against:
+A captioning tool's GPU advisor module — a third one, which at least knows what
+it is up against:
 
 ```python
 # NOTE: nvidia-smi shows aggregate VRAM usage from ALL processes (host + Docker containers).
 ```
 
-Three projects independently reimplementing the same reasoning about one card.
+Three tools independently reimplementing the same reasoning about one card.
 All three share the same defects:
 
 - **No reservation.** Observing 18 GB free does not make it yours. Two callers
   observe it simultaneously, both proceed, both die.
 - **Eviction is total.** The only lever is "unload everything," so a 512 MB
   embedding request costs a full reload of a 20 GB model.
-- **Failure is silent.** the batch pipeline's loop times out after 60 s and continues
+- **Failure is silent.** The poll loop times out after 60 s and continues
   anyway, into a card that does not have room.
 
-Nothing accounts for consumers that were never asked. `the desktop compositor` holds
-214 MiB right now; every budget on this box is wrong by that much and by
-whatever else drifts in.
+Nothing accounts for consumers that were never asked. The desktop compositor
+holds a couple of hundred MiB right now; every budget on the machine is wrong by
+that much and by whatever else drifts in.
 
 The fix is a single process that knows the true state of the card and is the
 only thing allowed to hand out room on it.
@@ -72,7 +73,7 @@ vramux can do to them*, not how much it trusts them.
 | tier | vramux can | examples |
 |---|---|---|
 | **managed** | start, stop, evict silently | language-model backends vramux itself spawns |
-| **leaseholder** | grant, deny, request yield | the batch pipeline, image stack, TTS, trainers |
+| **leaseholder** | grant, deny, request yield | batch pipelines, image stacks, TTS, trainers |
 | **foreign** | observe only | desktop compositor, stray scripts, anything unaware |
 
 **Managed** consumers are the easy case. vramux owns the process lifecycle, so
@@ -153,7 +154,7 @@ A lease is a promise that `mb` megabytes will remain available to the holder
 until released or expired.
 
 ```
-POST   /gpu/lease            {"mb": 18000, "owner": "the batch pipeline",
+POST   /gpu/lease            {"mb": 18000, "owner": "batch-pipeline",
                               "priority": 5, "ttl": 300, "wait": 120}
        → 200 {"lease": "lse_...", "granted_mb": 18000, "expires_at": "..."}
        → 408 if not grantable within `wait`
@@ -222,8 +223,8 @@ back to accounted-for, and the holder is a leaseholder again with its guarantee
 restored. If it asks for more than it currently holds, only the difference goes
 through admission.
 
-Container-resident consumers are the common case here — the image stack and the
-captioning backend both run their GPU work in containers — so PID attribution
+Container-resident consumers are the common case here — image stacks and
+captioning backends typically run their GPU work in containers — so PID attribution
 must map a container's processes to the lease. NVML reports host PIDs for
 container processes, which makes this tractable, but the mapping needs testing
 rather than assuming.
@@ -237,12 +238,12 @@ The wrapper is what makes leases adoptable, because it makes the correct
 version shorter than the broken version:
 
 ```bash
-vramux lease --mb 18000 --owner the batch pipeline -- ./stage2.sh
+vramux lease --mb 18000 --owner batch-pipeline -- ./stage2.sh
 ```
 
 Acquire, run, release on exit — including crash, including SIGKILL of the child,
 including the wrapper being killed. Renewal happens on a background thread for
-the command's lifetime. the batch pipeline's twelve-line poll loop becomes this.
+the command's lifetime. A twelve-line poll loop becomes this.
 
 Also:
 
@@ -277,9 +278,9 @@ Eviction order, cheapest regret first:
 4. **Never foreign.** Not evictable by definition.
 
 `exclusive: true` on a model config means it takes the whole card: admission
-evicts every managed resident and blocks on all leases. The 20 GB models on this
-box are all exclusive in practice, and declaring it is cheaper than discovering
-it through a failed cost estimate.
+evicts every managed resident and blocks on all leases. A 20 GB model on a 24 GB
+card is exclusive in practice, and declaring it is cheaper than discovering it
+through a failed cost estimate.
 
 ### 6.1 The in-flight problem
 
@@ -296,13 +297,13 @@ several. It contributes:
 - a registry of servable models and their configurations
 - backends that know how to start one: a local inference subprocess, or a
   container that ships its own server
-- translation between the **chat wire format** our clients already speak on
-  :11434 (`/api/chat`, `/api/tags`, `/api/generate`, `/api/embeddings`) and the
+- translation between the **chat wire format** clients already speak on :11434
+  (`/api/chat`, `/api/tags`, `/api/generate`, `/api/embeddings`) and the
   OpenAI-shaped API the backends actually expose
 
-That wire format is a compat surface and nothing more. It exists because every
-client on this box already speaks it; it is not a dependency and not part of
-the stack.
+That wire format is a compat surface and nothing more. It exists because the
+existing clients already speak it; it is not a dependency and not part of the
+stack.
 
 ### 7.1 Backend contract
 
@@ -355,17 +356,17 @@ without the broker.
 
 ## 9. Migration
 
-Existing consumers on this box, in dependency order:
+Existing consumers, in dependency order:
 
 | consumer | today | after |
 |---|---|---|
 | clients on :11434 | chat wire format | unchanged — same port, same shape |
-| `the batch pipeline` | unload + poll + hope | `vramux lease -- ./stage2.sh` |
-| `a `vram-free` helper` | stop stack, unload, print | `vramux free --mb N`, or deleted |
-| `the image stack` image stack | unmanaged, container | leaseholder; has an unload endpoint to yield with |
-| `the captioning tool` | `the GPU advisor` reads aggregate | leaseholder; drop the advisor, ask the broker |
+| batch pipeline | unload + poll + hope | `vramux lease -- ./stage2.sh` |
+| `vram-free` helper | stop stack, unload, print | `vramux free --mb N`, or deleted |
+| image stack | unmanaged, container | leaseholder; has an unload endpoint to yield with |
+| captioning tool | GPU advisor reads aggregate | leaseholder; drop the advisor, ask the broker |
 
-`the image stack` and `the captioning tool` both run their GPU work in containers and neither is
+The image and captioning stacks run their GPU work in containers and neither is
 controlled by vramux. They become leaseholders, not managed consumers — vramux
 grants and asks them to yield, it never starts or stops them. Until they adopt
 leases they are simply foreign, which is a correct and safe state, not a broken
@@ -375,7 +376,7 @@ The `keep_alive: 0` unload convention stays supported — it is a crude lease
 release and several things use it.
 
 Env prefix moves `MYLLAMA_*` → `VRAMUX_*`, with a shim that reads the old names
-and warns, because the unit file and several projects reference them.
+and warns, because the unit file and several dependent projects reference them.
 
 ## 10. Security
 
@@ -415,8 +416,8 @@ managed resident at a time, matching today's behaviour exactly. Rename and
 de-personalize. GPU-less test suite. This ships and is safe.
 
 **v0.2 — leases.**
-Lease API, TTL, renewal, CLI wrapper. Migrate the batch pipeline and the print pipeline, which
-is where the value first shows up outside this repo.
+Lease API, TTL, renewal, CLI wrapper. Migrate the batch pipeline and the
+`vram-free` helper, which is where the value first shows up outside this repo.
 
 **v0.3 — real mux.**
 Measure-and-learn feeding admission. Multi-resident, port pool, LRU eviction,
@@ -432,7 +433,7 @@ different implementation, so nothing is thrown away.
 - Does `/gpu/state` need to be streamable for a live view, or is polling fine?
 - PID attribution for container-resident leaseholders (§5.2) assumes NVML
   reports host PIDs for container processes. True in the common case; needs
-  testing against the actual image and captioning stacks before v0.2.
+  testing against real container stacks before v0.2.
 - Is per-consumer priority worth configuring, or is a two-level
   interactive/batch split enough?
 - Multi-GPU: device index is threaded through from the start, but placement
