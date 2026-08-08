@@ -106,6 +106,8 @@ documents both backend kinds.
 | `VRAMUX_CACHE_DIR` | `~/.cache/vramux` | where measured costs and usage history are written |
 | `VRAMUX_RESERVE_MB` | `1024` | headroom held back from every lease |
 | `VRAMUX_MAX_RESIDENTS` | `2` | ceiling on models resident at once; the budget is the real limit |
+| `VRAMUX_YIELD_WAIT` | `30` | seconds admission waits for a leaseholder to yield before loading anyway; `0` disables asking |
+| `VRAMUX_SERVING_PRIORITY` | `7` | what serving outranks; higher wins, leases default to 5 |
 | `VRAMUX_SAMPLE_INTERVAL` | `300` | seconds between usage-history samples; clamped up to the 5 s lease sweep it rides on |
 | `VRAMUX_EVENT_INTERVAL` | `1` | seconds between readings while a console is watching; nothing is read when none is |
 | `VRAMUX_EVENT_KEEPALIVE` | `15` | seconds of an unchanged card before the event stream sends a comment line |
@@ -240,6 +242,44 @@ The rules worth knowing before writing a client:
 Nothing needs a lease to be served a model. Consumers that have not migrated
 are foreign, which is a correct state and not a broken one.
 
+### Yield: being asked for it back
+
+A lease can be *asked* to give memory back. It can never be made to.
+
+When a model needs more than is free, or another lease is waiting, vramux marks
+the holders below the requester's priority and says how much is wanted. The
+holder finds out on its next renewal — the heartbeat it is already sending, so
+there is no callback URL and nothing to open a port for:
+
+```json
+{"lease": "lse_…", "granted_mb": 20000,
+ "yield": {"wanted_mb": 4273, "by": "serving:qwen3.5:9b",
+           "priority": 7, "deadline": "2026-08-08T00:24:13+00:00"}}
+```
+
+`vramux lease` prints that to stderr and, with `--on-yield term|int|hup`,
+forwards that signal to the command it is running. The default is to warn
+only: the wrapper does not know what your job is in the middle of, and killing
+a stage nine minutes into ten to free memory for a chat request is worse than
+the contention it solves.
+
+**Nothing is taken.** A holder that ignores the request keeps every byte; the
+deadline only decides when vramux logs that it was ignored, and the requester
+carries on exactly as it would have if yield did not exist. Serving waits
+`VRAMUX_YIELD_WAIT` seconds and then loads anyway.
+
+**Priority is higher-wins**, and yield is asked only of holders *strictly
+below* the asker — equal never yields, or every default holder would be asking
+every other one to move. Three points worth knowing:
+
+| priority | who |
+|---|---|
+| `1` | batch work: pipelines, renders, anything nobody is watching |
+| `5` | the default for a lease |
+| `7` | what serving admits with, and how a holder opts out of being asked |
+
+A model can name its own with `priority:` in `models.yml`.
+
 ## Layout
 
 ```
@@ -299,9 +339,11 @@ Serving does not take leases for its own residents. It does not need to: the
 budget is anchored on what the device reports, so a resident is accounted for
 whether or not anybody wrote it down.
 
-What is still missing is cooperative eviction — asking a leaseholder to yield.
-Today a lease is never revoked, so a big model waits for one to expire rather
-than negotiating.
+Cooperative eviction exists now: a leaseholder below the requester's priority
+is asked for the shortfall on its next heartbeat, and `vramux lease` can pass
+that on to the job it is running. What deliberately does not exist is
+enforcement — nothing revokes a lease, and a holder that ignores the request
+keeps its memory. A promise, not a fence.
 
 ## Contributing
 

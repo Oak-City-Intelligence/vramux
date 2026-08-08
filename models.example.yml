@@ -93,6 +93,12 @@ models:
     # every other resident for it and never admits anything beside it, which
     # is cheaper than discovering the same fact through a failed load.
     exclusive: true
+    # Optional. What this model outranks when it needs room, on the same
+    # higher-wins scale leases use (batch 1, default 5, interactive 7). Serving
+    # admits at 7 unless a model says otherwise, so a leaseholder at 1 gets
+    # asked to yield and one at 7 never does. Omit it unless this model should
+    # be quieter or louder than the rest.
+    # priority: 7
     weights_dir: ~/models/some-model   # size reporting only
     quantization: W2
     family: some-model

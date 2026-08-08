@@ -540,6 +540,40 @@ Two things the live run corrected, neither of them arithmetic:
 Rendering is a pure function from state to lines, so every layout decision is
 tested without a terminal, a card, or a router. 30 tests came with it.
 
+## After the stages — yield, 2026-08-07
+
+The numbered roadmap ended with the console. This is the first thing built past
+it, and it closes the gap every earlier stage was careful to name: **a lease was
+never revoked, so a big model waited for one to expire rather than asking for
+it back.** `DESIGN.md` §6 eviction tier 3, now §6.2.
+
+What it is: a request with a deadline, delivered on the heartbeat the holder is
+already sending. What it is not, and must never become: a way to take memory
+back. The deadline decides when vramux logs that a holder ignored it — nothing
+else. A holder that has never heard of yield behaves identically with it on,
+which is why it could be turned on against the live router the day it was
+written.
+
+It also had to answer the question this file listed as open since Stage 4:
+**priority is higher-wins**, with three named points (`batch` 1, default 5,
+`interactive` 7), asked strictly downward so equal never yields. `models.yml`
+grew `priority:`, and a holder opts out of ever being asked by taking the
+serving priority or above — an honour system, on a box with one operator, said
+out loud rather than pretended otherwise.
+
+Verified live, both directions:
+
+| what | result |
+|---|---|
+| a 16 000 MiB batch lease, then a model needing 272 MiB more | asked for **272 MiB**, not the model's whole cost |
+| the holder releasing | "the memory came back, 22 319 MiB free", load resumed in 13 s |
+| a holder that ignored it | "nothing yielded within 30s, loading into 2 319 MiB anyway", then one warning naming the holder |
+| `vramux lease --on-yield term` | forwarded SIGTERM to its command, which exited and released — the whole cooperative loop, end to end |
+| `vramux top` during a request | the lease row went red with "asked for 4 273 MiB by serving:qwen3.5:9b — 23s left" |
+
+18 tests, and the one that matters is `test_a_yield_request_takes_no_memory_and
+_shortens_no_lease`.
+
 ---
 
 ## Working around a busy GPU
@@ -586,4 +620,4 @@ subject.
 ## Open
 
 - Multi-GPU placement policy (device index threaded through, nothing designed)
-- Priority granularity: per-consumer, or just interactive versus batch
+- Whether anything should *enforce* priority. Yield asks; nothing takes

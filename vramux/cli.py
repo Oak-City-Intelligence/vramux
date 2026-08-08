@@ -67,16 +67,31 @@ def _fail(payload: dict, prefix: str = "") -> int:
     return 1
 
 
+_YIELD_SIGNALS = {
+    "term": signal.SIGTERM,
+    "int": signal.SIGINT,
+    "hup": signal.SIGHUP,
+}
+
+
 class _Renewer:
     """Heartbeat for a held lease, on a background thread.
 
     A thread rather than a task: the wrapper's foreground job is waiting on a
     child process, and mixing that with an event loop buys nothing here.
+
+    The heartbeat is also how a yield request arrives. That is the whole
+    transport: no callback URL for the broker to reach back on, no second
+    connection, nothing to open a port for — the holder is already talking
+    three times per TTL, and a holder that has stopped talking is about to
+    expire anyway.
     """
 
-    def __init__(self, url: str, ttl: float) -> None:
+    def __init__(self, url: str, ttl: float, on_yield=None) -> None:
         self.url = url
         self.interval = max(1.0, ttl / _RENEWALS_PER_TTL)
+        self._on_yield = on_yield
+        self._yielded = False
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
 
@@ -90,6 +105,7 @@ class _Renewer:
         while not self._stop.wait(self.interval):
             status, payload = _request(self.url, method="POST", body={})
             if status == 200:
+                self._check_yield(payload)
                 continue
             # Losing the lease mid-run is worth saying out loud: the memory is
             # no longer reserved, and the run is now racing anybody who asks.
@@ -100,6 +116,28 @@ class _Renewer:
             )
             if status in (404, 0):
                 return
+
+    def _check_yield(self, payload: dict) -> None:
+        """Say it once, and act only if the caller asked to act.
+
+        Defaulting to a signal would be wrong: this wrapper does not know what
+        the command it is running is in the middle of, and killing a job that
+        is nine minutes into a ten-minute stage to free memory for a chat
+        request is worse than the contention it solves. The operator decides
+        with `--on-yield`, and the default tells a human instead.
+        """
+        request = payload.get("yield")
+        if not request or self._yielded:
+            return
+        self._yielded = True
+        print(
+            f"vramux: {request.get('by', 'something')} is waiting for "
+            f"{request.get('wanted_mb', '?')} MiB of this lease "
+            f"(by {request.get('deadline', 'soon')}) — release it if you can",
+            file=sys.stderr,
+        )
+        if self._on_yield is not None:
+            self._on_yield(request)
 
 
 def lease(args) -> int:
@@ -136,13 +174,25 @@ def lease(args) -> int:
         f"expires {payload['expires_at']}",
         file=sys.stderr,
     )
-    renewer = _Renewer(_url(args, f"/gpu/lease/{lease_id}/renew"), args.ttl)
-    renewer.start()
     child: Optional[subprocess.Popen] = None
 
     def forward(signum, _frame):
         if child is not None and child.poll() is None:
             child.send_signal(signum)
+
+    def on_yield(_request) -> None:
+        # Opt-in, and it signals the command rather than releasing the lease:
+        # releasing while the child still holds the memory would hand the card
+        # to somebody else on the strength of a promise nobody kept.
+        sig = _YIELD_SIGNALS.get(getattr(args, "on_yield", "warn"))
+        if sig is None or child is None or child.poll() is not None:
+            return
+        print(f"vramux: forwarding {sig.name} to the command", file=sys.stderr)
+        child.send_signal(sig)
+
+    renewer = _Renewer(_url(args, f"/gpu/lease/{lease_id}/renew"), args.ttl,
+                       on_yield=on_yield)
+    renewer.start()
 
     previous = {
         sig: signal.signal(sig, forward) for sig in (signal.SIGINT, signal.SIGTERM)
@@ -220,4 +270,10 @@ def leases(args) -> int:
         print(f"  {row['granted_mb']:>7}  {row.get('observed_mb', 0):>7}  "
               f"{row['priority']:>3}  "
               f"{row['expires_at']:<26} {row['owner']}  ({row['lease']})")
+        # A holder that has been asked for its memory is the only thing here
+        # worth a second line: it is the state where somebody else is waiting.
+        asked = row.get("yield")
+        if asked:
+            print(f"      ↳ asked to yield {asked.get('wanted_mb', '?')} MiB for "
+                  f"{asked.get('by', '?')} by {asked.get('deadline', '?')}")
     return 0

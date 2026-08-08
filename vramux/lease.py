@@ -67,6 +67,27 @@ SAMPLE_INTERVAL = 300.0
 POLL_INTERVAL = 2.0
 WAIT_LOG_INTERVAL = 15.0
 
+# Priority: **higher wins**, and the scale exists so that "interactive" and
+# "batch" are sayable without every client inventing its own numbers.
+#
+# The direction had to be picked, since `priority` has been accepted and inert
+# since leases shipped. Higher-is-more-important matches how schedulers people
+# already know spell it, and reads correctly to somebody who has never opened
+# this file: `priority: 9` is more urgent than `priority: 1`.
+#
+# Yield is asked of holders **strictly below** the requester. Equal never
+# yields: with a default of 5 on both sides, "at or below" would have every
+# ordinary holder asking every other ordinary holder to get off the card, and
+# the tie broken by whoever asked last.
+PRIORITY_BATCH = 1
+PRIORITY_DEFAULT = 5
+PRIORITY_INTERACTIVE = 7
+
+# How long a holder is given to act on a yield request before it is recorded as
+# having ignored one. It is a deadline for reporting, never for taking: nothing
+# in vramux revokes a lease when this passes.
+YIELD_DEADLINE = 30.0
+
 # Ancestry walks stop here. A pid chain on a healthy system is a handful of
 # levels; a longer one means something is wrong and is not worth chasing.
 _MAX_ANCESTRY_DEPTH = 32
@@ -148,6 +169,45 @@ def descends_from(pid: int, roots, parent_of=ppid_of) -> bool:
 
 
 @dataclass
+class YieldRequest:
+    """Somebody is waiting on this memory, and is asking rather than taking.
+
+    vramux cannot revoke a lease. It does not own the holder's process, the
+    allocation is not its to free, and a broker that pretended otherwise would
+    be lying about the one thing it is for. So tier 3 of the eviction order is
+    a request with a deadline, and the deadline is a *reporting* boundary: when
+    it passes, the holder is recorded as having ignored one and the requester
+    goes back to waiting or failing exactly as it did before yield existed.
+
+    This is the whole reason the feature is safe to ship on a live machine. A
+    holder that has never heard of yield behaves identically with it turned on.
+    """
+
+    wanted_mb: int
+    by: str
+    priority: int
+    requested_at: float
+    deadline: float
+    requested_iso: str = ""
+    deadline_iso: str = ""
+    # Set once, when the deadline passes with the lease still held, so the log
+    # says it exactly once rather than every sweep for the rest of the TTL.
+    reported_ignored: bool = False
+
+    def overdue(self, now: float) -> bool:
+        return now >= self.deadline
+
+    def to_json(self) -> dict:
+        return {
+            "wanted_mb": self.wanted_mb,
+            "by": self.by,
+            "priority": self.priority,
+            "requested_at": self.requested_iso,
+            "deadline": self.deadline_iso,
+        }
+
+
+@dataclass
 class Lease:
     """One grant, alive until released or expired."""
 
@@ -168,6 +228,10 @@ class Lease:
     # life. What it is holding *now* is `observed_mb`, which only the broker
     # can answer because only the broker reads the card.
     covered_at_grant_mb: int = 0
+    # An outstanding request to give this memory back, or None. A lease with
+    # one set is still a lease: nothing here takes memory, and a holder that
+    # ignores the request holds exactly what it held before.
+    yield_request: Optional["YieldRequest"] = None
 
     def expired(self, now: float) -> bool:
         return now >= self.expires_at
@@ -191,6 +255,11 @@ class Lease:
             "granted_at": self.granted_iso,
             "expires_at": self.expires_iso,
             "covered_at_grant_mb": self.covered_at_grant_mb,
+            # `null` unless somebody is waiting on this memory. A holder sees
+            # it on its next renewal, which is why yield needs no callback URL
+            # and no second connection: the heartbeat is already there, and a
+            # holder that is not heartbeating is about to expire anyway.
+            "yield": self.yield_request.to_json() if self.yield_request else None,
         }
 
 
@@ -261,6 +330,10 @@ class Broker:
         # Why the last attempt did not grant, so a wait and a 408 can both say
         # something more useful than "busy".
         self._blocked_reason = "the card is busy"
+        # How much the last attempt was short by, which is what a yield request
+        # asks for. Asking for the whole grant when 400 MiB was missing would
+        # stop far more work than the request needs.
+        self._blocked_short_mb = 0
 
     # ---- what is held ---------------------------------------------------------
 
@@ -372,13 +445,24 @@ class Broker:
 
         deadline = time.monotonic() + wait
         last_log = time.monotonic()
+        asked_to_yield = False
         while True:
             async with self._lock:
                 lease = await self._try_grant(mb, owner, ttl, priority, pids)
                 if lease is not None:
                     return lease
                 blocked = self._blocked_reason
+                short = self._blocked_short_mb
             now = time.monotonic()
+            if not asked_to_yield and short > 0 and now < deadline:
+                # Once per acquire, not once per poll: a waiting request that
+                # re-asks every two seconds is a holder being nagged, and the
+                # first ask already told it everything the tenth would.
+                asked_to_yield = True
+                await self.request_yield(
+                    short, by=f"lease:{owner}", priority=priority,
+                    deadline=deadline - now,
+                )
             if now >= deadline:
                 raise NoRoom(
                     f"{mb} MiB not available within {wait:.0f}s ({blocked})"
@@ -406,6 +490,9 @@ class Broker:
             # A load in flight has not allocated yet, so the card reads freer
             # than it is about to be. Waiting is the honest answer.
             self._blocked_reason = f"{load.get('tag', 'a model')} is loading"
+            # Not a shortfall a leaseholder can fix: the memory is about to be
+            # taken by something that already won admission.
+            self._blocked_short_mb = 0
             return None
         observed = self._observed_for(snapshot, pids)
         charge = budget_mod.charge_for(mb, observed)
@@ -413,7 +500,9 @@ class Broker:
             self._blocked_reason = (
                 f"{charge} MiB needed, {current.free_mb} MiB free"
             )
+            self._blocked_short_mb = charge - current.free_mb
             return None
+        self._blocked_short_mb = 0
         return self._record(mb, owner, ttl, priority, pids, observed, charge)
 
     def _record(
@@ -449,6 +538,83 @@ class Broker:
         else:
             log.info("granted %s to %s (ttl %.0fs), %d MiB", lease.id, owner, ttl, mb)
         return lease
+
+    # ---- yield ----------------------------------------------------------------
+
+    async def request_yield(
+        self,
+        mb: int,
+        by: str,
+        priority: int = PRIORITY_DEFAULT,
+        deadline: float = YIELD_DEADLINE,
+    ) -> List[Lease]:
+        """Ask holders below `priority` to give `mb` back. Returns who was asked.
+
+        Tier 3 of `DESIGN.md` §6, and the only tier vramux cannot perform
+        itself: residents it started it can stop, but a leaseholder is somebody
+        else's process holding somebody else's allocation. So this marks, logs,
+        and returns. **It frees nothing and must never learn how.**
+
+        Holders are asked cheapest-first — least memory that still helps — so a
+        27B model arriving does not evict a whole batch pipeline when a 2 GB
+        probe would have covered it. Asking is not free to the person on the
+        other end of the process being asked to stop.
+        """
+        mb = max(0, int(mb))
+        now = time.monotonic()
+        asked: List[Lease] = []
+        async with self._lock:
+            candidates = sorted(
+                (l for l in self._leases.values()
+                 if l.priority < priority and l.yield_request is None),
+                key=lambda l: l.mb,
+            )
+            covered = 0
+            for lease in candidates:
+                if covered >= mb:
+                    break
+                lease.yield_request = YieldRequest(
+                    wanted_mb=mb,
+                    by=by,
+                    priority=priority,
+                    requested_at=now,
+                    deadline=now + max(0.1, float(deadline)),
+                    requested_iso=_iso(0),
+                    deadline_iso=_iso(max(0.1, float(deadline))),
+                )
+                covered += lease.mb
+                asked.append(lease)
+        for lease in asked:
+            log.info(
+                "asked %s (%s, priority %d) to yield %d MiB for %s — it holds %d MiB",
+                lease.id, lease.owner, lease.priority, mb, by, lease.mb,
+            )
+        if not asked:
+            log.debug("nothing to ask: no lease below priority %d for %s", priority, by)
+        return asked
+
+    def yielding(self) -> List[Lease]:
+        """Leases with an outstanding request against them."""
+        return [l for l in self._leases.values() if l.yield_request is not None]
+
+    def _report_ignored_yields(self, now: float) -> None:
+        """Say once, loudly, that a holder kept memory it was asked for.
+
+        Same rule as expiry: it is a bug in the holder, and a quiet log line
+        would hide the one number that says whether cooperative eviction is
+        actually cooperating on this machine.
+        """
+        for lease in self._leases.values():
+            request = lease.yield_request
+            if request is None or request.reported_ignored or not request.overdue(now):
+                continue
+            request.reported_ignored = True
+            log.warning(
+                "lease %s (%s) still holds %d MiB %.0fs after being asked to yield "
+                "it for %s — nothing will take it, and the requester waited for "
+                "nothing", lease.id, lease.owner, lease.mb,
+                now - request.requested_at, request.by,
+            )
 
     # ---- release, renew -------------------------------------------------------
 
@@ -519,6 +685,7 @@ class Broker:
         renewal can land in between, and dropping a freshly renewed lease would
         pull the card out from under a holder that did everything right.
         """
+        self._report_ignored_yields(time.monotonic())
         candidates = [lease for lease in self.leases if lease.expired(time.monotonic())]
         if not candidates:
             return []

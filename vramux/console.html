@@ -59,6 +59,7 @@
   }
   th { color: var(--dim); font-weight: 500; font-size: .8rem; }
   tr.warn td { color: var(--warn); }
+  tr.hot td { color: var(--hot); }
   .empty, footer { color: var(--dim); }
   footer { margin-top: 2rem; font-size: .8rem; }
   .loading { color: var(--warn); margin-top: .5rem; }
@@ -186,10 +187,15 @@ function draw() {
 
   const leases = (state.leases || []).slice()
     .sort((a, b) => (b.granted_mb || 0) - (a.granted_mb || 0));
+  // Being asked to yield outranks the outstanding mark: one is a holder that
+  // has not allocated yet, which is normal; the other is somebody waiting on
+  // this memory right now.
   fill(document.getElementById("leases"), leases.map((l) => row([
-    l.owner, mb(l.granted_mb), mb(l.observed_mb), mb(l.outstanding_mb),
+    l.yield ? `${l.owner} — asked for ${mb(l.yield.wanted_mb)} MiB by ${l.yield.by}`
+            : l.owner,
+    mb(l.granted_mb), mb(l.observed_mb), mb(l.outstanding_mb),
     until(l.expires_at),
-  ], l.outstanding_mb ? "warn" : "")), "no leases held", 5);
+  ], l.yield ? "hot" : (l.outstanding_mb ? "warn" : ""))), "no leases held", 5);
 
   // A leaseholder's process is not listed again down here: its memory is
   // already on screen as held, and showing it twice reads as two allocations.

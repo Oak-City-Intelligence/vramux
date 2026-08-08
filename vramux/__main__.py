@@ -16,11 +16,22 @@ from aiohttp import web
 
 from . import cli, env
 from .budget import DEFAULT_RESERVE_MB
-from .lease import DEFAULT_TTL, SAMPLE_INTERVAL, Broker, clamped_sample_interval
+from .lease import (
+    DEFAULT_TTL,
+    PRIORITY_DEFAULT,
+    SAMPLE_INTERVAL,
+    Broker,
+    clamped_sample_interval,
+)
 from .observer import CostCache, Observer
 from .registry import ModelRegistry
 from .router import make_app
-from .residency import DEFAULT_MAX_RESIDENTS, ResidencyArbiter
+from .residency import (
+    DEFAULT_MAX_RESIDENTS,
+    DEFAULT_SERVING_PRIORITY,
+    DEFAULT_YIELD_WAIT,
+    ResidencyArbiter,
+)
 
 
 def _serve(args: argparse.Namespace) -> None:
@@ -35,6 +46,8 @@ def _serve(args: argparse.Namespace) -> None:
         idle_timeout=args.idle_timeout,
         observer=observer,
         max_residents=args.max_residents,
+        yield_wait=args.yield_wait,
+        serving_priority=args.serving_priority,
     )
     # `loading` rather than the arbiter itself: the broker needs to know a load
     # is in flight — it has not allocated yet, so the card reads freer than it
@@ -50,6 +63,9 @@ def _serve(args: argparse.Namespace) -> None:
     # side needs one callable from the other and neither should import the
     # other's module.
     arbiter.use_budget(broker.budget)
+    # The other half of tier 3: residency can stop what it started, and asking
+    # a leaseholder to give memory back is the only move it has left.
+    arbiter.use_yield(broker.request_yield)
     app = make_app(registry, arbiter, broker)
     web.run_app(app, host=args.host, port=args.port, print=None)
 
@@ -146,6 +162,13 @@ def main() -> None:
     parser.add_argument("--max-residents", type=int,
                         default=env.get_int("MAX_RESIDENTS", DEFAULT_MAX_RESIDENTS),
                         help="most models allowed resident at once")
+    parser.add_argument("--yield-wait", type=float,
+                        default=env.get_float("YIELD_WAIT", DEFAULT_YIELD_WAIT),
+                        help="seconds admission waits for a leaseholder to yield "
+                             "before loading anyway; 0 disables asking")
+    parser.add_argument("--serving-priority", type=int,
+                        default=env.get_int("SERVING_PRIORITY", DEFAULT_SERVING_PRIORITY),
+                        help="what serving outranks; higher wins, leases default to 5")
     parser.add_argument("--sample-interval", type=float,
                         default=env.get_float("SAMPLE_INTERVAL", SAMPLE_INTERVAL),
                         help="seconds between usage-history samples")
@@ -163,7 +186,13 @@ def main() -> None:
                          help="seconds before the lease expires unrenewed")
     p_lease.add_argument("--wait", type=float, default=0.0,
                          help="seconds to wait for room before giving up")
-    p_lease.add_argument("--priority", type=int, default=5)
+    p_lease.add_argument("--priority", type=int, default=PRIORITY_DEFAULT,
+                         help="higher wins; a holder below the asker's priority "
+                              "is the one asked to yield")
+    p_lease.add_argument("--on-yield", choices=("warn", "term", "int", "hup"),
+                         default="warn",
+                         help="what to do when something asks for this memory: "
+                              "warn (default), or forward that signal to the command")
     p_lease.add_argument("command", nargs=argparse.REMAINDER,
                          help="the command to run, after `--`")
 

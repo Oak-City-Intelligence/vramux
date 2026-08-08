@@ -312,14 +312,20 @@ def render(state: Optional[dict], width: int = 80, height: int = 24,
         lines.append(Line(" no leases held", "dim"))
     for row in sorted(leases, key=lambda r: -int(r.get("granted_mb") or 0)):
         outstanding = int(row.get("outstanding_mb") or 0)
+        asked = row.get("yield")
         lines.append(Line(_clip(
             f" {row.get('owner', '?'):<28} {_mb(row.get('granted_mb')):>8}"
             f" {_mb(row.get('observed_mb')):>8} {_mb(outstanding):>7}"
             f" {_expires_in(row.get('expires_at'), now):>5}", width),
-            # A grant nobody has allocated against is normal right after it is
-            # taken and worth looking at an hour later. The console cannot tell
-            # the two apart, so it marks the fact, not a verdict.
-            "warn" if outstanding else ""))
+            # Being asked to yield outranks the outstanding mark: one is a
+            # holder that has not allocated yet, which is normal; the other is
+            # somebody waiting on this memory right now.
+            "hot" if asked else ("warn" if outstanding else "")))
+        if asked:
+            lines.append(Line(_clip(
+                f"   asked for {_mb(asked.get('wanted_mb'))} MiB by "
+                f"{asked.get('by', '?')} — "
+                f"{_expires_in(asked.get('deadline'), now)} left", width), "hot"))
 
     # ---- everything else on the card
     #

@@ -44,6 +44,20 @@ from .registry import KIND_DOCKER, ModelSpec
 log = logging.getLogger("vramux.residency")
 
 
+# How long admission waits for a leaseholder to act on a yield request before
+# loading anyway. Bounded and short: the holder is being asked, not told, and a
+# request that waits minutes for an answer that may never come has turned a
+# cooperative gesture into a hang.
+DEFAULT_YIELD_WAIT = 30.0
+
+# What serving outranks by default — one step above the lease default, because
+# a human is waiting on a chat request and nothing is waiting on a batch stage.
+# A holder that does not want to be asked takes this priority or higher.
+DEFAULT_SERVING_PRIORITY = 7
+
+# How often the budget is re-read while waiting for a yield.
+_YIELD_POLL = 1.0
+
 # Ceiling on residents, whatever the budget says. The budget is the real
 # constraint; this is a bound on how many upstream ports and backend processes
 # one card is allowed to sprout, and a place to stand if packing ever turns
@@ -124,6 +138,9 @@ class ResidencyArbiter:
         observer: Optional[Observer] = None,
         max_residents: int = DEFAULT_MAX_RESIDENTS,
         budget=None,
+        request_yield=None,
+        yield_wait: float = DEFAULT_YIELD_WAIT,
+        serving_priority: int = DEFAULT_SERVING_PRIORITY,
     ) -> None:
         self.host = host
         self.port = port
@@ -134,6 +151,15 @@ class ResidencyArbiter:
         # admission has no honest way to decide a second resident fits, and
         # falls back to serving one at a time.
         self._budget = budget
+        # The broker's `request_yield()`, injected the same way. Tier 3 of the
+        # eviction order is the only one residency cannot perform itself: it
+        # can stop what it started, and a leaseholder is somebody else's
+        # process. None disables asking entirely, which is what every test that
+        # does not care about leases gets.
+        self._request_yield = request_yield
+        self.yield_wait = max(0.0, float(yield_wait))
+        # What serving outranks when a model does not name its own priority.
+        self.serving_priority = serving_priority
         # Consecutive upstream ports, one per possible llama-server. Containers
         # publish their own and never take one.
         self._free_ports: List[int] = [port + i for i in range(self.max_residents)]
@@ -155,6 +181,14 @@ class ResidencyArbiter:
         self._loading: Optional[Loading] = None
         self._lock = asyncio.Lock()
         self._idle_task: Optional[asyncio.Task] = None
+
+    def use_yield(self, request_yield) -> None:
+        """Hand residency the broker's `request_yield()`.
+
+        Same shape as `use_budget`, for the same reason: one callable each way
+        rather than two modules importing one another.
+        """
+        self._request_yield = request_yield
 
     def use_budget(self, budget) -> None:
         """Hand residency the broker's `budget()`.
@@ -389,6 +423,57 @@ class ResidencyArbiter:
             if fits:
                 return
             await self._evict_lru(spec, self._room_reason)
+        # Everything vramux can stop is stopped. What is left on the card
+        # belongs to somebody else, and tier 3 of §6 is the only move: ask.
+        await self._ask_leases_to_yield(spec)
+
+    async def _ask_leases_to_yield(self, spec: ModelSpec) -> None:
+        """Ask leaseholders below this model's priority for the shortfall.
+
+        Bounded, voluntary, and it never runs when it cannot help: no yield
+        callable, no budget, no measured cost, or nothing actually short means
+        this returns immediately and the load proceeds exactly as it did
+        before. Nothing here revokes anything — the wait ends and the load goes
+        ahead regardless, which is the same thing that happened before yield
+        existed, only now the holder was told.
+        """
+        if self._request_yield is None or self.yield_wait <= 0:
+            return
+        cost = self._cost_mb(spec)
+        if cost is None or self._budget is None:
+            return
+        try:
+            budget = await self._budget()
+        except Exception as exc:
+            log.warning("could not read the budget to ask for a yield: %s", exc)
+            return
+        short = cost - budget.free_mb
+        if short <= 0:
+            return
+        priority = spec.priority if spec.priority is not None else self.serving_priority
+        asked = await self._request_yield(
+            short, f"serving:{spec.tag}", priority, self.yield_wait,
+        )
+        if not asked:
+            return
+        log.info(
+            "%s needs %d MiB more than is free; asked %d lease(s) to yield, "
+            "waiting up to %.0fs", spec.tag, short, len(asked), self.yield_wait,
+        )
+        deadline = time.monotonic() + self.yield_wait
+        while time.monotonic() < deadline:
+            await asyncio.sleep(min(_YIELD_POLL, max(0.05, deadline - time.monotonic())))
+            try:
+                budget = await self._budget()
+            except Exception:
+                return
+            if cost <= budget.free_mb:
+                log.info("%s: the memory came back, %d MiB free", spec.tag, budget.free_mb)
+                return
+        log.warning(
+            "%s: nothing yielded within %.0fs, loading into %d MiB anyway",
+            spec.tag, self.yield_wait, budget.free_mb,
+        )
 
     def _must_be_alone(self, spec: ModelSpec) -> Optional[str]:
         """Why `spec` cannot share the card, or None if it can.

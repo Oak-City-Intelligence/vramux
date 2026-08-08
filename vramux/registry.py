@@ -119,6 +119,12 @@ class ModelSpec:
     # for it and never admits anything beside it. Declaring it is cheaper than
     # discovering it through a failed load.
     exclusive: bool = False
+    # What this model outranks when it needs room. Higher wins, matching the
+    # lease scale in `lease.py`; the default sits above the lease default so
+    # that serving — which is what a human is waiting on — can ask a batch
+    # holder to yield, and a lease that does not want to be asked can say so by
+    # taking a priority at or above this.
+    priority: Optional[int] = None
     # Per-model idle timeout. A container that takes minutes to become ready
     # should not be evicted on the same schedule as a GGUF that loads in
     # seconds. None = use the arbiter default.
@@ -305,6 +311,7 @@ class ModelRegistry:
                         family=entry.get("family"),
                         vram_mb=(int(entry["vram_mb"]) if entry.get("vram_mb") is not None else None),
                         exclusive=bool(entry.get("exclusive", False)),
+                        priority=(int(entry["priority"]) if entry.get("priority") is not None else None),
                     )
                     continue
                 gguf = Path(entry["gguf"]).expanduser()
@@ -319,6 +326,7 @@ class ModelRegistry:
                     family=entry.get("family"),
                     vram_mb=(int(entry["vram_mb"]) if entry.get("vram_mb") is not None else None),
                     exclusive=bool(entry.get("exclusive", False)),
+                    priority=(int(entry["priority"]) if entry.get("priority") is not None else None),
                 )
         # Drop auto-discovered specs whose GGUF is already covered by YAML —
         # keeps the listed-tags clean and avoids ugly filename-derived names.

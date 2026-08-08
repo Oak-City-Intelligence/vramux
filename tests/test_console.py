@@ -373,3 +373,19 @@ async def test_the_browser_console_is_served_and_needs_nothing_off_the_network(c
     assert "/gpu/events" in page, "it draws from the same stream the TUI does"
     for remote in ("http://", "https://", "//cdn", "<img", "@import"):
         assert remote not in page, f"the page must not reach for {remote}"
+
+
+def test_a_lease_being_asked_to_yield_outranks_the_outstanding_mark():
+    """Two different facts, and only one of them means somebody is waiting: an
+    unallocated grant is normal, a yield request is contention happening now."""
+    lease = {"lease": "abc", "owner": "batch", "granted_mb": 12000,
+             "observed_mb": 12100, "outstanding_mb": 0, "priority": 1,
+             "expires_at": "2026-08-07T12:01:00+00:00", "ttl": 60,
+             "yield": {"wanted_mb": 6000, "by": "serving:big:27b", "priority": 7,
+                       "requested_at": "2026-08-07T12:00:00+00:00",
+                       "deadline": "2026-08-07T12:00:30+00:00"}}
+    lines = render(state(leases=[lease]), width=100, now=NOON)
+    assert styles(lines, "batch") == "hot"
+    drawn = text(lines)
+    assert "asked for 6 000 MiB by serving:big:27b" in drawn
+    assert "30s left" in drawn, "the holder's deadline counts down"

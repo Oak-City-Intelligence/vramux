@@ -282,13 +282,64 @@ Eviction order, cheapest regret first:
    drain window.
 3. **Leaseholders below the requester's priority**, via yield request. Voluntary,
    with a deadline. A holder that does not yield keeps its memory and the
-   requester waits or fails.
+   requester waits or fails. **Built** — §6.2.
 4. **Never foreign.** Not evictable by definition.
 
 `exclusive: true` on a model config means it takes the whole card: admission
 evicts every managed resident and blocks on all leases. A 20 GB model on a 24 GB
 card is exclusive in practice, and declaring it is cheaper than discovering it
 through a failed cost estimate.
+
+### 6.2 Yield: the tier vramux cannot perform itself
+
+Tiers 1 and 2 are vramux stopping things vramux started. Tier 3 is not: a
+leaseholder is somebody else's process holding somebody else's allocation,
+and nothing in a broker can free it. So the mechanism is a **request with a
+deadline**, and the deadline is a reporting boundary rather than a taking one.
+
+**Asking is not taking, and the code must never learn how.** When the deadline
+passes with the lease still held, one warning is logged and the requester goes
+back to waiting or failing exactly as it would have before yield existed. This
+is why the feature was safe to turn on against a live machine on the day it was
+written: a holder that has never heard of it behaves identically with it on.
+
+**The transport is the heartbeat.** A renewal response carries a `yield` object
+— who wants it, how much, by when — or `null`. No callback URL, no second
+connection, nothing for a holder behind a container to publish, and no way for
+a holder to be asked but not hear: it is already talking three times per TTL,
+and one that has stopped talking is about to expire anyway.
+
+```
+POST /gpu/lease/{id}/renew
+  → 200 {"lease": "lse_...", ..., "yield": {"wanted_mb": 4273,
+                                            "by": "serving:qwen3.5:9b",
+                                            "priority": 7,
+                                            "deadline": "..."}}
+```
+
+**Priority is higher-wins**, which this document finally has to say because the
+field was accepted and inert from Stage 4 until now. Three named points —
+`batch` 1, default 5, `interactive` 7 — so that the two cases people actually
+have are sayable without every client inventing a scale. Yield is asked of
+holders **strictly below** the requester: equal never yields, or with a default
+of 5 on both sides every ordinary holder would be asking every other ordinary
+holder to get off the card.
+
+Two consequences worth stating plainly:
+
+- **The shortfall is what gets asked for, not the request.** A model needing
+  272 MiB more than is free asks for 272 MiB, and the holders asked are the
+  *cheapest* that cover it. Stopping a twelve-gigabyte pipeline to make room
+  for a rounding error is worse than the contention.
+- **A holder opts out by outranking the asker.** Taking `priority: 7` or above
+  means serving never asks. That is an honour system on a single-operator box,
+  and it is one on purpose — the alternative is enforcement, and vramux does
+  not have any (§5, and "a lease is a promise, not a fence").
+
+The serving side waits `VRAMUX_YIELD_WAIT` (30 s, `0` disables asking
+entirely) and then loads anyway. Waiting indefinitely for an answer that may
+never come turns a cooperative gesture into a hang, and the load was going to
+happen regardless — the only question was whether the holder got told first.
 
 ### 6.1 The in-flight problem
 
@@ -479,7 +530,11 @@ different implementation, so nothing is thrown away.
   the container's compute process attributes correctly. Note that the compose
   column layout varies by version, so the PID column must be read from the
   header rather than by index.
-- Is per-consumer priority worth configuring, or is a two-level
-  interactive/batch split enough?
+- ~~Is per-consumer priority worth configuring, or is a two-level
+  interactive/batch split enough?~~ **Answered by building yield.** Neither, or
+  both: the field stays a plain integer, higher-wins, with three named points
+  (`batch` 1, default 5, `interactive` 7) so the two-level case needs no
+  configuration and a third level needs no new mechanism. What is still
+  undecided is whether anything should *enforce* it, and nothing does.
 - Multi-GPU: device index is threaded through from the start, but placement
   policy is undesigned.
