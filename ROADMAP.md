@@ -508,9 +508,11 @@ returns. Both open questions in this file are answered by it:
   samples at all while nobody is attached. A console that cannot stream falls
   back to polling `/gpu/state` and says so on screen, which is also what
   happens against a router older than this file.
-- **A TUI, not a web view** — stdlib `curses`, no dependency, works over the
-  SSH connection you open when the box is in trouble. A page can come later
-  and would read the same endpoint.
+- **A TUI first, and then a web view** — `vramux top` is stdlib `curses`, no
+  dependency, and works over the SSH connection you open when the box is in
+  trouble. `/gpu/console` serves the same view as one self-contained HTML
+  file that reads the same stream: no build step, no framework, and nothing
+  fetched from a network the machine may not have.
 
 Frames go out **on change**, which is why the payload carries absolute
 timestamps and no ages: an idle counter computed server-side ticks every

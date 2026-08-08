@@ -1,0 +1,234 @@
+<!doctype html>
+<!--
+  The same console as `vramux top`, in a browser, from the same event stream.
+
+  One file, no build, no assets, no fonts, no framework: it is served straight
+  off disk by the router and must keep working on a machine with no network at
+  all — which is the state the box is usually in when somebody wants to know
+  what is holding the card.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vramux</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fbfbfa; --fg: #1c1c1a; --dim: #6b6b66; --rule: #dedcd6;
+    --used: #3b6ea5; --reserve: #b9b4a8; --warn: #a86a10; --hot: #b23c2c;
+    --panel: #ffffff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16171a; --fg: #e6e5e1; --dim: #8d8d87; --rule: #2c2e33;
+      --used: #6ea8dc; --reserve: #55565c; --warn: #d9a441; --hot: #e2705d;
+      --panel: #1c1d21;
+    }
+  }
+  body {
+    margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  main { max-width: 60rem; margin: 0 auto; }
+  h1 { font-size: 1rem; font-weight: 600; margin: 0 0 .25rem; }
+  h2 {
+    font-size: .75rem; font-weight: 600; letter-spacing: .08em;
+    text-transform: uppercase; color: var(--dim);
+    margin: 1.75rem 0 .5rem;
+  }
+  .status { color: var(--dim); font-size: .8rem; margin-bottom: 1.25rem; }
+  .status.bad { color: var(--hot); }
+  .bar {
+    display: flex; height: 1.35rem; border: 1px solid var(--rule);
+    border-radius: 3px; overflow: hidden; background: var(--panel);
+  }
+  .bar span { display: block; }
+  .bar .u { background: var(--used); }
+  .bar .r { background: var(--reserve); }
+  .numbers { margin: .5rem 0 0; color: var(--dim); }
+  .numbers b { color: var(--fg); font-weight: 600; }
+  .numbers.tight b, .numbers.tight { color: var(--hot); }
+  table { width: 100%; border-collapse: collapse; }
+  th, td {
+    text-align: right; padding: .3rem .5rem; border-bottom: 1px solid var(--rule);
+    white-space: nowrap;
+  }
+  th:first-child, td:first-child {
+    text-align: left; width: 99%; overflow: hidden; text-overflow: ellipsis;
+  }
+  th { color: var(--dim); font-weight: 500; font-size: .8rem; }
+  tr.warn td { color: var(--warn); }
+  .empty, footer { color: var(--dim); }
+  footer { margin-top: 2rem; font-size: .8rem; }
+  .loading { color: var(--warn); margin-top: .5rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1 id="card">vramux</h1>
+  <p class="status" id="status">connecting…</p>
+
+  <div class="bar" id="bar"><span class="u" style="width:0"></span><span class="r" style="width:0"></span></div>
+  <p class="numbers" id="numbers"></p>
+  <p class="loading" id="loading" hidden></p>
+
+  <h2>Resident</h2>
+  <table><thead><tr>
+    <th>model</th><th>cost</th><th>port</th><th>in flight</th><th>idle</th>
+  </tr></thead><tbody id="residents"></tbody></table>
+
+  <h2>Leases</h2>
+  <table><thead><tr>
+    <th>owner</th><th>grant</th><th>held</th><th>outstanding</th><th>ttl</th>
+  </tr></thead><tbody id="leases"></tbody></table>
+
+  <h2>Foreign</h2>
+  <table><thead><tr>
+    <th>process</th><th>MiB</th><th>pid</th>
+  </tr></thead><tbody id="foreign"></tbody></table>
+
+  <footer>
+    <strong>held</strong> is what a leaseholder has on the card now;
+    <strong>outstanding</strong> is the grant it has not allocated against yet.
+    Held above the grant is normal — a CUDA context costs a few hundred MiB
+    nobody asks for, which is what the reserve covers.
+  </footer>
+</main>
+<script>
+"use strict";
+
+// Absolute timestamps in, human ages out. The router deliberately sends no
+// ages: a counter computed server-side would tick every second and make every
+// frame a change, which is the opposite of what an event stream is for.
+const mb = (n) => (n === null || n === undefined || n === "" || isNaN(n))
+  ? "—" : Number(n).toLocaleString("en-GB").replace(/,/g, " ");
+
+function duration(seconds) {
+  seconds = Math.floor(seconds);
+  if (!isFinite(seconds) || seconds < 0) return "0s";
+  if (seconds < 60) return seconds + "s";
+  if (seconds < 3600) return Math.floor(seconds / 60) + "m";
+  return Math.floor(seconds / 3600) + "h";
+}
+
+const ago = (iso) => iso ? duration((Date.now() - Date.parse(iso)) / 1000) : "—";
+const until = (iso) => iso ? duration((Date.parse(iso) - Date.now()) / 1000) : "—";
+
+function row(cells, cls) {
+  const tr = document.createElement("tr");
+  if (cls) tr.className = cls;
+  for (const cell of cells) {
+    const td = document.createElement("td");
+    td.textContent = cell;
+    tr.appendChild(td);
+  }
+  return tr;
+}
+
+function fill(tbody, rows, emptyText, columns) {
+  tbody.replaceChildren();
+  if (!rows.length) {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = columns;
+    td.className = "empty";
+    td.textContent = emptyText;
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+    return;
+  }
+  for (const r of rows) tbody.appendChild(r);
+}
+
+let latest = null;
+
+function draw() {
+  const state = latest;
+  if (!state || state.error) return;
+  const device = state.device || {};
+  const budget = state.budget || {};
+  const total = device.total_mb || 0;
+  const used = device.used_mb || 0;
+  const reserve = budget.reserve_mb || 0;
+  const free = budget.free_mb !== undefined ? budget.free_mb : device.free_mb;
+
+  document.getElementById("card").textContent =
+    `${device.name || "gpu"} (gpu${device.index ?? 0})`;
+
+  const usedPct = total ? (used / total) * 100 : 0;
+  const reservePct = total ? Math.min(100 - usedPct, (reserve / total) * 100) : 0;
+  const bar = document.getElementById("bar");
+  bar.children[0].style.width = usedPct + "%";
+  bar.children[1].style.width = reservePct + "%";
+
+  const numbers = document.getElementById("numbers");
+  numbers.innerHTML =
+    `<b>${mb(used)}</b> / ${mb(total)} MiB used (${Math.round(usedPct)}%)` +
+    ` &nbsp; grantable <b>${mb(free)}</b>` +
+    ` &nbsp; reserve ${mb(reserve)} &nbsp; foreign ${mb(state.foreign_mb)}`;
+  // At or below the reserve the next request is refused. That is the number
+  // worth colouring, not raw usage.
+  numbers.classList.toggle("tight", free !== undefined && free <= reserve);
+
+  const loading = document.getElementById("loading");
+  loading.hidden = !state.loading;
+  if (state.loading) {
+    loading.textContent =
+      `loading ${state.loading.tag} — ${state.loading.elapsed_s}s of ${state.loading.budget_s}s`;
+  }
+
+  const residents = state.resident_detail
+    || (state.residents || []).map((tag) => ({ tag }));
+  fill(document.getElementById("residents"), residents.map((r) => row([
+    r.tag, mb(r.cost_mb), r.port ?? "—", r.inflight ?? 0, ago(r.last_use),
+  ])), "nothing resident", 5);
+
+  const leases = (state.leases || []).slice()
+    .sort((a, b) => (b.granted_mb || 0) - (a.granted_mb || 0));
+  fill(document.getElementById("leases"), leases.map((l) => row([
+    l.owner, mb(l.granted_mb), mb(l.observed_mb), mb(l.outstanding_mb),
+    until(l.expires_at),
+  ], l.outstanding_mb ? "warn" : "")), "no leases held", 5);
+
+  // A leaseholder's process is not listed again down here: its memory is
+  // already on screen as held, and showing it twice reads as two allocations.
+  const leased = new Set(leases.flatMap((l) => l.pids || []));
+  const foreign = (state.processes || [])
+    .filter((p) => !p.owner && !leased.has(p.pid))
+    .sort((a, b) => (b.used_mb || 0) - (a.used_mb || 0));
+  fill(document.getElementById("foreign"), foreign.map((p) => row([
+    (p.name || "?").split(" ")[0].split("/").pop(), mb(p.used_mb), p.pid,
+  ])), "nothing else on the card", 3);
+}
+
+function status(text, bad) {
+  const el = document.getElementById("status");
+  el.textContent = text;
+  el.classList.toggle("bad", !!bad);
+}
+
+function connect() {
+  const source = new EventSource("/gpu/events");
+  source.addEventListener("state", (event) => {
+    try {
+      latest = JSON.parse(event.data);
+    } catch (err) {
+      return;
+    }
+    status(latest.error ? latest.error : "streaming", !!latest.error);
+    draw();
+  });
+  // EventSource reconnects on its own; say so rather than going quiet, since a
+  // page that stops updating silently looks exactly like an idle card.
+  source.addEventListener("error", () => status("reconnecting…", true));
+  source.addEventListener("open", () => status("streaming", false));
+}
+
+// The ages and TTLs on screen are computed here, so they have to keep counting
+// on a card where nothing is happening and no frame is due.
+setInterval(draw, 1000);
+connect();
+</script>
+</body>
+</html>

@@ -360,3 +360,16 @@ def test_the_feed_reports_a_router_that_is_not_there(monkeypatch):
     feed.poll_once()
     assert feed.state is None
     assert "cannot reach vramux" in (feed.error or "")
+
+
+async def test_the_browser_console_is_served_and_needs_nothing_off_the_network(client):
+    """One file, no assets: the box that wants this page is usually the box
+    with no network, and a page that fetches a font from a CDN is a blank
+    screen exactly then."""
+    resp = await client.get("/gpu/console")
+    assert resp.status == 200
+    assert resp.headers["Content-Type"].startswith("text/html")
+    page = await resp.text()
+    assert "/gpu/events" in page, "it draws from the same stream the TUI does"
+    for remote in ("http://", "https://", "//cdn", "<img", "@import"):
+        assert remote not in page, f"the page must not reach for {remote}"

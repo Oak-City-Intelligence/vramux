@@ -16,6 +16,7 @@ import json
 import logging
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import aiohttp
@@ -308,6 +309,23 @@ class Router:
         finally:
             self.feed.unsubscribe(queue)
         return resp
+
+    async def gpu_console(self, _request: web.Request) -> web.Response:
+        """The same console as `vramux top`, for a browser.
+
+        One static file, read from disk on each request — it is a few
+        kilobytes, and a page that reloads when the file changes is worth more
+        than a cached string during the only time anybody edits it. Serving it
+        adds no API surface: everything it knows it learns from `/gpu/events`,
+        exactly as the terminal console does.
+        """
+        page = Path(__file__).with_name("console.html")
+        try:
+            body = page.read_text(encoding="utf-8")
+        except OSError as exc:
+            log.warning("console page missing at %s: %s", page, exc)
+            return web.json_response({"error": "console page not installed"}, status=404)
+        return web.Response(text=body, content_type="text/html")
 
     async def state_payload(self) -> Optional[dict]:
         """The `/gpu/state` body, or None when the card cannot be read.
@@ -740,6 +758,7 @@ def make_app(
     app.router.add_get("/api/ps", r.ps)
     app.router.add_get("/gpu/state", r.gpu_state)
     app.router.add_get("/gpu/events", r.gpu_events)
+    app.router.add_get("/gpu/console", r.gpu_console)
     app.router.add_get("/gpu/lease", r.lease_list)
     app.router.add_post("/gpu/lease", r.lease_acquire)
     app.router.add_delete("/gpu/lease/{lease_id}", r.lease_release)

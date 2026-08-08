@@ -54,6 +54,13 @@ discussion; they will not be treated as vulnerabilities.
 - **Backends are not sandboxed.** They run as you, with your environment, and
   vramux's job is starting and stopping them rather than confining them.
 
+- **`/gpu/console` is a page on an unauthenticated port.** It is read-only —
+  it renders `/gpu/events` and calls nothing that changes state — and it is
+  served from a file in the checkout with no assets fetched from anywhere. It
+  adds no capability the API did not already grant to whoever can reach the
+  port, which is the same loopback boundary as everything else here. No CORS
+  headers are set, so a page on another origin cannot read the stream.
+
 ## What is defended, and what to report
 
 - **Command construction.** Backends are spawned as argument vectors, never

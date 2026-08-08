@@ -51,6 +51,7 @@ not defended.
 - a container left running by a previous process is stopped at startup
 - `GET /gpu/state` — what is resident, what is foreign, what each model cost
 - `GET /gpu/events` — the same state as server-sent events, pushed on change
+- `GET /gpu/console` — that stream drawn as a page, in one dependency-free file
 - `POST /gpu/lease`, `DELETE /gpu/lease/{id}`, `POST /gpu/lease/{id}/renew` —
   memory reserved for consumers vramux does not run
 - `POST /gpu/evict` — unload a named resident by hand
@@ -192,6 +193,11 @@ nothing is sampled at all while nobody is watching.
 
 `vramux top --once` prints a single frame and exits, for logs and pipes.
 
+The same console is at **`http://localhost:11434/gpu/console`** for a browser:
+one file, no build step, no fonts or scripts fetched from anywhere, because
+the machine that wants this page is usually the machine with no network left.
+It reads `/gpu/events` and shows exactly what the terminal view does.
+
 ## Leases
 
 A lease reserves VRAM for something vramux does not run — an image stack, a
@@ -246,6 +252,7 @@ vramux/
   lease.py        the broker: grants, expiry, reclaim by process tree
   cli.py          the client side — `lease`, `free`, `evict`, stdlib only
   console.py      `vramux top` — a pure renderer and an SSE reader, stdlib only
+  console.html    the same console as a page, served at /gpu/console
   registry.py     ModelSpec, YAML config, dir scan, ollama-blob discovery
   backends.py     the Backend contract: ProcessBackend + DockerComposeBackend
   residency.py    who is on the card: admission, eviction, drain, idle
