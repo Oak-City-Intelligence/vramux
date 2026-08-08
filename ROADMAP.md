@@ -576,6 +576,40 @@ _shortens_no_lease`.
 
 ---
 
+## After the stages — history on the console, 2026-08-07
+
+The sampler has written `usage.jsonl` since Stage 4 and nothing could read it
+back over HTTP, so both consoles could draw the card as it is and never as it
+has been. `GET /gpu/history` closes that, and the page grew a sparkline of the
+last hour: used solid, foreign dashed, scaled against the card's total rather
+than against its own extent, so a quiet hour looks quiet instead of looking
+like a busy one at a different zoom.
+
+Three decisions worth keeping:
+
+- **A separate endpoint, not a field on `/gpu/state`.** History changes once a
+  sample interval. Shipping it in a frame that goes out on every change would
+  put an hour of unchanged rows on the wire whenever a single number moved.
+- **It reads the file and never the card.** A console redrawing its chart costs
+  no `nvidia-smi` call, which is the same argument `StateFeed` makes for
+  streaming rather than polling.
+- **`interval_s` travels with the rows.** Twelve points is an hour or a minute
+  depending on the cadence, and the page uses it twice: to label the chart, and
+  to break the line across a gap wider than a couple of intervals. Joining
+  across the hours a router was down would draw a confident straight line
+  through memory nobody measured.
+
+The live check was a throwaway router on another port with
+`VRAMUX_SAMPLE_INTERVAL=5` and its own cache directory, plus
+`tools/hold_vram.py` — 9 000 MiB appearing and going away, on screen, without
+touching the running service. 10 tests came with it.
+
+`vramux top` did not get the sparkline. The TUI reads one stream and nothing
+else, and giving it a second transport to draw a chart at 5 s samples in
+`curses` buys less than it costs.
+
+---
+
 ## Working around a busy GPU
 
 For most of this work the card was occupied by a training run. That constrains

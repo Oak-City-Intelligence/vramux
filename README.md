@@ -52,6 +52,8 @@ not defended.
 - `GET /gpu/state` — what is resident, what is foreign, what each model cost
 - `GET /gpu/events` — the same state as server-sent events, pushed on change
 - `GET /gpu/console` — that stream drawn as a page, in one dependency-free file
+- `GET /gpu/history` — the recorded usage samples, for drawing where the card
+  has been
 - `POST /gpu/lease`, `DELETE /gpu/lease/{id}`, `POST /gpu/lease/{id}/renew` —
   memory reserved for consumers vramux does not run
 - `POST /gpu/evict` — unload a named resident by hand
@@ -198,7 +200,33 @@ nothing is sampled at all while nobody is watching.
 The same console is at **`http://localhost:11434/gpu/console`** for a browser:
 one file, no build step, no fonts or scripts fetched from anywhere, because
 the machine that wants this page is usually the machine with no network left.
-It reads `/gpu/events` and shows exactly what the terminal view does.
+It reads `/gpu/events` and shows exactly what the terminal view does, plus one
+thing the terminal view does not have: a sparkline of the last hour, used and
+foreign, drawn from the recorded samples.
+
+### History
+
+The sampler has been writing `~/.cache/vramux/usage.jsonl` since Stage 4, and
+`GET /gpu/history` is how anything reads it back:
+
+```bash
+curl -s 'localhost:11434/gpu/history?minutes=60' | head -c 200
+# {"interval_s": 300.0, "minutes": 60.0, "rows": [{"foreign_mb": 410, ...
+```
+
+`minutes` (default 60) and `limit` (default and maximum 2000) bound the answer.
+The endpoint reads the file and never the card, so a page redrawing its chart
+costs no `nvidia-smi` call at all — which is also why it is a separate endpoint
+rather than a field on `/gpu/state`, where an hour of unchanged rows would go
+out with every frame.
+
+`interval_s` comes back with the rows because the two only mean something
+together: at the default `VRAMUX_SAMPLE_INTERVAL` of five minutes an hour is
+twelve points, and a caller that does not know the spacing will draw a smooth
+line through data it does not have. The console uses it for both — it labels
+the chart with the real cadence, and it breaks the line rather than joining
+across a gap wider than a couple of intervals, because a straight line through
+the hours a router was down is a claim about memory nobody measured.
 
 ## Leases
 

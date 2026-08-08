@@ -60,6 +60,14 @@
   th { color: var(--dim); font-weight: 500; font-size: .8rem; }
   tr.warn td { color: var(--warn); }
   tr.hot td { color: var(--hot); }
+  .spark {
+    display: block; width: 100%; height: 4.5rem; margin-top: .25rem;
+    border: 1px solid var(--rule); border-radius: 3px; background: var(--panel);
+  }
+  .spark path { fill: none; stroke-width: 1.25; }
+  .spark .used { stroke: var(--used); }
+  .spark .foreign { stroke: var(--dim); stroke-dasharray: 3 2; }
+  .caption { color: var(--dim); font-size: .8rem; margin: .35rem 0 0; }
   .empty, footer { color: var(--dim); }
   footer { margin-top: 2rem; font-size: .8rem; }
   .loading { color: var(--warn); margin-top: .5rem; }
@@ -73,6 +81,14 @@
   <div class="bar" id="bar"><span class="u" style="width:0"></span><span class="r" style="width:0"></span></div>
   <p class="numbers" id="numbers"></p>
   <p class="loading" id="loading" hidden></p>
+
+  <h2>Last hour</h2>
+  <svg class="spark" id="spark" viewBox="0 0 100 24" preserveAspectRatio="none"
+       aria-label="used and foreign memory over the last hour">
+    <path class="used" vector-effect="non-scaling-stroke"></path>
+    <path class="foreign" vector-effect="non-scaling-stroke"></path>
+  </svg>
+  <p class="caption" id="spark-caption"></p>
 
   <h2>Resident</h2>
   <table><thead><tr>
@@ -208,6 +224,86 @@ function draw() {
   ])), "nothing else on the card", 3);
 }
 
+// ---- history -------------------------------------------------------------
+//
+// Recorded samples only, fetched on their own timer. The live stream is not
+// mixed in: frames arrive when the state *changes*, so splicing them into a
+// series sampled every five minutes would draw a dense recent tail and a
+// sparse past out of what is really one evenly spaced measurement.
+
+const HISTORY_MINUTES = 60;
+const FALLBACK_INTERVAL_S = 300;
+
+// Named `usage`, not `history`: a top-level `let history` in a classic
+// script shadows `window.history` for the whole file.
+let usage = null;
+
+function drawHistory() {
+  const caption = document.getElementById("spark-caption");
+  const svg = document.getElementById("spark");
+  const [usedPath, foreignPath] = svg.children;
+  if (!usage) return;
+  if (usage.failed) {
+    usedPath.setAttribute("d", "");
+    foreignPath.setAttribute("d", "");
+    caption.textContent = "history unavailable";
+    return;
+  }
+
+  const rows = usage.rows || [];
+  const interval = usage.interval_s || FALLBACK_INTERVAL_S;
+  const now = Date.now();
+  const span = HISTORY_MINUTES * 60000;
+  // The window is fixed to the hour asked for, not to the extent of the data,
+  // so twelve points across an hour look like twelve points across an hour.
+  const x = (t) => Math.max(0, Math.min(100, ((t - (now - span)) / span) * 100));
+
+  const observed = rows.map((r) => r.used_mb || 0);
+  const total = (latest && latest.device && latest.device.total_mb)
+    || Math.max(1, ...observed) * 1.15;
+  const y = (mb) => 24 - Math.max(0, Math.min(1, mb / total)) * 24;
+
+  // A gap wider than a couple of intervals is the router having been down.
+  // Joining across it draws a straight line through hours nobody measured.
+  const maxGap = interval * 1000 * 2.5;
+  const pathFor = (key) => {
+    let d = "", prev = null;
+    for (const r of rows) {
+      const t = Date.parse(r.t);
+      const value = r[key];
+      if (!isFinite(t) || value === undefined || value === null) continue;
+      d += (prev !== null && t - prev <= maxGap ? "L" : "M")
+        + x(t).toFixed(2) + "," + y(value).toFixed(2) + " ";
+      prev = t;
+    }
+    return d.trim();
+  };
+  usedPath.setAttribute("d", pathFor("used_mb"));
+  foreignPath.setAttribute("d", pathFor("foreign_mb"));
+
+  const every = interval >= 60
+    ? Math.round(interval / 60) + "m" : Math.round(interval) + "s";
+  caption.textContent = rows.length
+    ? `0–${mb(Math.round(total))} MiB · used (solid), foreign (dashed)`
+      + ` · ${rows.length} sample${rows.length === 1 ? "" : "s"}, one every ${every}`
+    : `no samples in the last hour — the card is recorded every ${every}`;
+}
+
+async function loadHistory() {
+  try {
+    const response = await fetch(`/gpu/history?minutes=${HISTORY_MINUTES}`);
+    if (!response.ok) throw new Error(response.status);
+    usage = await response.json();
+  } catch (err) {
+    usage = { failed: true };
+  }
+  drawHistory();
+  // Refetch on the sampler's own cadence: asking faster than the card is
+  // recorded returns the same rows and reads the file for nothing.
+  const seconds = Math.min(600, Math.max(30, usage.interval_s || FALLBACK_INTERVAL_S));
+  setTimeout(loadHistory, seconds * 1000);
+}
+
 function status(text, bad) {
   const el = document.getElementById("status");
   el.textContent = text;
@@ -232,9 +328,12 @@ function connect() {
 }
 
 // The ages and TTLs on screen are computed here, so they have to keep counting
-// on a card where nothing is happening and no frame is due.
-setInterval(draw, 1000);
+// on a card where nothing is happening and no frame is due. The sparkline is
+// redrawn on the same tick and not inside `draw()`: its window ends at *now*,
+// so its points walk left whether or not a state frame ever arrives.
+setInterval(() => { draw(); drawHistory(); }, 1000);
 connect();
+loadHistory();
 </script>
 </body>
 </html>

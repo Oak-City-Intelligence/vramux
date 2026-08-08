@@ -163,6 +163,7 @@ POST   /gpu/lease            {"mb": 18000, "owner": "batch-pipeline",
 DELETE /gpu/lease/{id}        release
 POST   /gpu/lease/{id}/renew  extend by ttl
 GET    /gpu/state             residents, leases, foreign, free
+GET    /gpu/history           recorded usage samples, off disk, never the card
 ```
 
 **TTL is mandatory and there is no infinite lease.** A holder that dies without

@@ -7,6 +7,7 @@ whatever the test says it is.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -373,6 +374,57 @@ def test_a_torn_history_line_does_not_poison_the_rest(tmp_path):
     path = tmp_path / "usage.jsonl"
     path.write_text('{"used_mb": 1}\n{"used_mb": 2\n{"used_mb": 3}\n')
     assert [r["used_mb"] for r in UsageLog(path).rows()] == [1, 3]
+
+
+def _history(tmp_path, *rows) -> UsageLog:
+    path = tmp_path / "usage.jsonl"
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    return UsageLog(path)
+
+
+def _stamp(minutes_ago: float) -> str:
+    return (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).isoformat()
+
+
+def test_recent_keeps_the_window_asked_for_and_drops_the_rest(tmp_path):
+    """A console drawing "the last hour" must not be handed yesterday, or the
+    hour it wanted arrives squeezed into the last pixel of the chart."""
+    log = _history(
+        tmp_path,
+        {"t": _stamp(600), "used_mb": 1},
+        {"t": _stamp(90), "used_mb": 2},
+        {"t": _stamp(30), "used_mb": 3},
+        {"t": _stamp(1), "used_mb": 4},
+    )
+    assert [r["used_mb"] for r in log.recent(minutes=60)] == [3, 4]
+    assert [r["used_mb"] for r in log.recent()] == [1, 2, 3, 4]
+
+
+def test_recent_returns_the_newest_rows_when_it_is_capped(tmp_path):
+    """The cap bounds the response; the newest end is the one worth keeping."""
+    log = _history(tmp_path, *({"t": _stamp(i), "used_mb": i} for i in (5, 4, 3, 2, 1)))
+    assert [r["used_mb"] for r in log.recent(limit=2)] == [2, 1]
+
+
+def test_a_row_with_no_readable_timestamp_is_dropped_from_a_window(tmp_path):
+    """It cannot be shown to fall inside the hour, and guessing puts a sample
+    of unknown age on a time axis as though it were now."""
+    log = _history(
+        tmp_path,
+        {"used_mb": 1},
+        {"t": "not a date", "used_mb": 2},
+        {"t": _stamp(5), "used_mb": 3},
+    )
+    assert [r["used_mb"] for r in log.recent(minutes=60)] == [3]
+    assert len(log.recent()) == 3, "unwindowed reads stay a faithful dump of the file"
+
+
+def test_a_naive_timestamp_is_read_as_utc_rather_than_raising(tmp_path):
+    """Nothing writes one, but the file is a plain log a human may have
+    edited, and a comparison that raises would take the whole endpoint out."""
+    naive = (datetime.now(timezone.utc) - timedelta(minutes=5)).replace(tzinfo=None)
+    log = _history(tmp_path, {"t": naive.isoformat(), "used_mb": 7})
+    assert [r["used_mb"] for r in log.recent(minutes=60)] == [7]
 
 
 def test_an_unwritable_history_does_not_raise(tmp_path):

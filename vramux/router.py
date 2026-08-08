@@ -65,6 +65,13 @@ EVENT_INTERVAL = max(0.1, env.get_float("EVENT_INTERVAL", 1.0))
 # is watching a card it lost sight of ten minutes ago.
 EVENT_KEEPALIVE = max(EVENT_INTERVAL, env.get_float("EVENT_KEEPALIVE", 15.0))
 
+# How far back `/gpu/history` looks when nobody says, and the most rows it will
+# ever return. The cap is a bound on the response, not on the file: a console
+# asking for a month of five-minute samples wants a shape, and eight thousand
+# points is a shape drawn at a resolution no screen has.
+HISTORY_DEFAULT_MINUTES = 60.0
+HISTORY_MAX_POINTS = 2000
+
 
 ROUTER: "web.AppKey[Router]" = web.AppKey("router")
 
@@ -309,6 +316,44 @@ class Router:
         finally:
             self.feed.unsubscribe(queue)
         return resp
+
+    async def gpu_history(self, request: web.Request) -> web.Response:
+        """What the card has looked like, so a console can draw a shape.
+
+        Read off disk, never off the device: a page redrawing its sparkline
+        costs a file read and no `nvidia-smi` call, which is the same argument
+        `StateFeed` makes for streaming. It is also why this is a separate
+        endpoint rather than a field on `/gpu/state` — history changes once a
+        sample interval, and shipping it in every frame would put kilobytes of
+        unchanged rows on the wire once a second.
+
+        `interval_s` is returned with the rows because the two are only
+        meaningful together: at the default five minutes an hour is twelve
+        points, and a caller that does not know the spacing will draw a smooth
+        line through data it does not have.
+        """
+        observer = self.arbiter.observer
+        if observer is None:
+            return web.json_response({"error": "observation disabled"}, status=503)
+        try:
+            minutes = float(request.query.get("minutes", HISTORY_DEFAULT_MINUTES))
+            limit = int(request.query.get("limit", HISTORY_MAX_POINTS))
+        except ValueError:
+            return web.json_response(
+                {"error": "minutes and limit must be numbers"}, status=400
+            )
+        if minutes <= 0 or limit <= 0:
+            return web.json_response(
+                {"error": "minutes and limit must be positive"}, status=400
+            )
+        rows = observer.history.recent(
+            minutes=minutes, limit=min(limit, HISTORY_MAX_POINTS)
+        )
+        return web.json_response({
+            "interval_s": self.broker.sample_interval if self.broker else None,
+            "minutes": minutes,
+            "rows": rows,
+        })
 
     async def gpu_console(self, _request: web.Request) -> web.Response:
         """The same console as `vramux top`, for a browser.
@@ -758,6 +803,7 @@ def make_app(
     app.router.add_get("/api/ps", r.ps)
     app.router.add_get("/gpu/state", r.gpu_state)
     app.router.add_get("/gpu/events", r.gpu_events)
+    app.router.add_get("/gpu/history", r.gpu_history)
     app.router.add_get("/gpu/console", r.gpu_console)
     app.router.add_get("/gpu/lease", r.lease_list)
     app.router.add_post("/gpu/lease", r.lease_acquire)

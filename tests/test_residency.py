@@ -316,10 +316,26 @@ async def test_reconcile_failure_does_not_block_startup(monkeypatch):
 # ---- observation ----------------------------------------------------------
 
 
+class EmptyHistory:
+    """A usage log that recorded nothing.
+
+    The state endpoints read `observer.history` the same way they read
+    `observer.cache`, so a fake observer needs the attribute even though
+    nothing in these tests samples the card.
+    """
+
+    def rows(self, limit=None):
+        return []
+
+    def recent(self, minutes=None, limit=None):
+        return []
+
+
 class RecordingObserver:
     """Stands in for the real observer: records the calls, decides nothing."""
 
     def __init__(self) -> None:
+        self.history = EmptyHistory()
         self.claims = []
         self.releases = []
         self.measured = []

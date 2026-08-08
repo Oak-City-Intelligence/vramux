@@ -11,11 +11,14 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
 from vramux.console import Feed, _bar, _duration, _iter_sse, render
+from vramux.observer import UsageLog
 from vramux.registry import ModelRegistry
 from vramux.residency import ResidencyArbiter
 from vramux.router import ROUTER, StateFeed, make_app
@@ -338,6 +341,75 @@ async def _first_event(resp) -> dict:
         if line.startswith("data:"):
             return json.loads(line[5:])
     raise AssertionError("the stream ended without an event")
+
+
+# ---- history, for the sparkline --------------------------------------------
+
+
+async def test_history_returns_the_recorded_window_and_its_spacing(client, tmp_path):
+    """Rows without `interval_s` are a shape at an unknown resolution, so the
+    two travel together: twelve points is an hour or a minute depending on it.
+    """
+    now = datetime.now(timezone.utc)
+    log = UsageLog(tmp_path / "usage.jsonl")
+    log.path.write_text("".join(
+        json.dumps({"t": (now - timedelta(minutes=m)).isoformat(),
+                    "used_mb": 7000 + m, "foreign_mb": 400}) + "\n"
+        for m in (300, 40, 10)
+    ))
+    client.app[ROUTER].arbiter.observer.history = log
+
+    body = await (await client.get("/gpu/history?minutes=60")).json()
+    assert [r["used_mb"] for r in body["rows"]] == [7040, 7010]
+    assert body["minutes"] == 60
+    assert "interval_s" in body, "the caller cannot label the axis without it"
+
+
+async def test_history_reads_the_file_and_never_the_card(client, tmp_path):
+    """The whole argument for a separate endpoint: a page redrawing its
+    sparkline must not cost an `nvidia-smi` call."""
+    def explode():
+        raise AssertionError("the history endpoint probed the device")
+
+    client.app[ROUTER].arbiter.observer.snapshot = explode
+    assert (await client.get("/gpu/history")).status == 200
+
+
+async def test_history_refuses_a_window_that_is_not_a_number(client):
+    body = await (await client.get("/gpu/history?minutes=lastweek")).json()
+    assert "must be numbers" in body["error"]
+
+
+async def test_history_refuses_a_window_of_nothing(client):
+    """`minutes=0` would return an empty chart that reads as "the card was
+    idle", which is a different claim from "you asked for no time at all"."""
+    assert (await client.get("/gpu/history?minutes=0")).status == 400
+    assert (await client.get("/gpu/history?limit=-1")).status == 400
+
+
+async def test_history_reports_the_samplers_interval_when_there_is_a_broker(client):
+    """`interval_s` is the broker's, because the broker's timer is what writes
+    the rows — nothing else in the process knows the cadence."""
+    router = client.app[ROUTER]
+    router.broker = SimpleNamespace(sample_interval=42.0)
+    try:
+        body = await (await client.get("/gpu/history")).json()
+    finally:
+        router.broker = None
+    assert body["interval_s"] == 42.0
+
+
+async def test_history_is_refused_when_nothing_is_observing(isolated_registry,
+                                                            monkeypatch, tmp_path):
+    monkeypatch.setenv("VRAMUX_MODELS_CONFIG", str(tmp_path / "none.yml"))
+    monkeypatch.setenv("VRAMUX_MODEL_DIR", str(tmp_path / "none"))
+    app = make_app(ModelRegistry(), ResidencyArbiter(observer=None), None)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        assert (await client.get("/gpu/history")).status == 503
+    finally:
+        await client.close()
 
 
 async def test_events_are_refused_when_nothing_is_observing(isolated_registry,

@@ -29,7 +29,7 @@ import os
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -69,6 +69,23 @@ def _history_path() -> Path:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+_EPOCH = datetime.fromtimestamp(0, timezone.utc)
+
+
+def _parse_ts(value) -> Optional[datetime]:
+    """A recorded timestamp as a datetime, or None if it is not one.
+
+    Rows are written by `_now()` and are always tz-aware, but the file is a
+    plain log a human may have edited, so a naive timestamp is read as UTC
+    rather than raising on a comparison.
+    """
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 def cost_key(spec) -> str:
@@ -284,6 +301,23 @@ class UsageLog:
             except json.JSONDecodeError:
                 continue  # a torn last line is not worth failing over
         return out
+
+    def recent(self, minutes: Optional[float] = None, limit: Optional[int] = None) -> List[dict]:
+        """The tail of the history, oldest first.
+
+        Age is filtered after the read rather than by seeking to a timestamp:
+        the file is bounded at `max_rows`, so the whole of it is a couple of
+        megabytes and one pass over it costs less than being clever. A row
+        whose timestamp cannot be parsed is dropped when a window was asked
+        for — it cannot be shown to fall inside one.
+        """
+        rows = self.rows()
+        if minutes is not None:
+            cutoff = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+            rows = [r for r in rows if (_parse_ts(r.get("t")) or _EPOCH) >= cutoff]
+        if limit is not None and limit > 0:
+            rows = rows[-limit:]
+        return rows
 
     def _count_rows(self) -> int:
         try:
