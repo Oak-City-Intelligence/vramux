@@ -113,7 +113,8 @@ class ModelSpec:
     # What this model costs on the card, when nobody has measured it yet.
     # Required for container backends if they are ever to be admitted beside
     # another model: their internals are not introspectable, so there is
-    # nothing to estimate from. A measured cost always wins over this.
+    # nothing to estimate from. This is also a floor for measured cost, so a
+    # contended partial offload cannot redefine the configuration as cheaper.
     vram_mb: Optional[int] = None
     # This model wants the whole card. Admission evicts every other resident
     # for it and never admits anything beside it. Declaring it is cheaper than

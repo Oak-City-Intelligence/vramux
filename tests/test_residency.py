@@ -14,7 +14,7 @@ import pytest
 from vramux.budget import Budget
 from vramux.observer import cost_key
 from vramux.registry import KIND_DOCKER, ModelSpec
-from vramux.residency import ResidencyArbiter
+from vramux.residency import PartialOffload, ResidencyArbiter
 
 
 class FakeBackend:
@@ -491,12 +491,41 @@ async def test_a_declared_cost_is_enough_to_pack_a_container():
 
 async def test_a_second_model_that_does_not_fit_evicts_the_first():
     sup = packing_arbiter({"a:9b": 6591, "big:27b": 18970}, free_mb=10000)
+    async def budget_after_eviction():
+        sup.free_mb = 10000 if sup.residents else 20000
+        return await _fake_budget(sup)
+    sup.use_budget(budget_after_eviction)
     await sup.acquire(spec("a:9b"))
     sup.release("a:9b")
     await sup.acquire(spec("big:27b"))
     sup.release("big:27b")
 
     assert sup.events == ["start:a:9b", "stop:a:9b", "start:big:27b"]
+
+
+async def test_a_partial_offload_below_the_declared_floor_is_stopped():
+    class PartialObserver(RecordingObserver):
+        def measuring(self, spec):
+            observer = self
+
+            class Result:
+                measured_mb = 1000
+
+            class Ctx:
+                async def __aenter__(self):
+                    observer.measured.append(spec.tag)
+                    return Result()
+
+                async def __aexit__(self, *exc):
+                    return False
+
+            return Ctx()
+
+    sup = FakeArbiter(observer=PartialObserver())
+    with pytest.raises(PartialOffload):
+        await sup.acquire(spec("big:27b", vram_mb=2000))
+    assert sup.residents == []
+    assert sup.events == ["start:big:27b", "stop:big:27b"]
 
 
 async def test_an_exclusive_model_takes_the_card_in_both_directions():

@@ -110,9 +110,9 @@ def cost_key(spec) -> str:
 def known_cost_mb(cache, spec) -> Optional[int]:
     """What this model costs, or `None` when nobody actually knows.
 
-    Two sources and no third one. A measurement of this exact configuration is
-    authoritative; a `vram_mb:` in config is the operator's word for backends
-    whose internals cannot be introspected. There is deliberately no estimate:
+    Two sources and no third one. Measurements of this exact configuration
+    establish a high-water mark; a `vram_mb:` declaration is an operator-set
+    floor. There is deliberately no estimate:
     `DESIGN.md` §4.2 describes one, and an estimate is exactly what must not
     decide whether a second model joins a card that is already holding one —
     an underestimate is an OOM that takes the innocent resident with it. A
@@ -120,12 +120,13 @@ def known_cost_mb(cache, spec) -> Optional[int]:
     whole life before this, and it becomes packable the first time it loads.
     """
     entry = cache.get(cost_key(spec)) if cache is not None else None
-    if entry and entry.get("measured_mb"):
-        return int(entry["measured_mb"])
+    measured = int(entry["measured_mb"]) if entry and entry.get("measured_mb") else 0
     declared = getattr(spec, "vram_mb", None)
-    if declared:
-        return int(declared)
-    return None
+    declared = int(declared) if declared else 0
+    # A declaration is an operator-supplied floor, not merely a bootstrap
+    # guess. llama-server auto-fit can successfully start with most layers on
+    # CPU when the card is busy; that observation must not poison admission.
+    return max(measured, declared) or None
 
 
 @dataclass
@@ -191,6 +192,13 @@ class Snapshot:
         return "\n".join(lines)
 
 
+@dataclass
+class Measurement:
+    """Result populated when an ``Observer.measuring`` window closes."""
+
+    measured_mb: Optional[int] = None
+
+
 class CostCache:
     """Measured footprints, keyed by configuration. Written, never yet read
     by anything that decides."""
@@ -221,11 +229,15 @@ class CostCache:
         if not self._loaded:
             self.load()
         prior = self._entries.get(key) or {}
+        # Cost is an admission ceiling. A lower observation can mean that the
+        # backend silently reduced GPU offload under contention, so retain the
+        # high-water mark rather than making a known configuration look cheap.
+        retained_mb = max(int(measured_mb), int(prior.get("measured_mb", 0)))
         self._entries[key] = {
             "tag": spec.tag,
             "kind": spec.kind,
             "ctx": spec.ctx_size,
-            "measured_mb": measured_mb,
+            "measured_mb": retained_mb,
             "samples": int(prior.get("samples", 0)) + 1,
             "previous_mb": prior.get("measured_mb"),
             "updated": _now(),
@@ -416,15 +428,18 @@ class Observer:
         Nothing raised in here can stop the load: a failed measurement is a
         missing data point, not a failed request.
         """
+        measurement = Measurement()
         before = await self._safe_snapshot()
         started = time.monotonic()
         try:
-            yield
+            yield measurement
         except Exception:
             raise
         else:
             after = await self._safe_snapshot()
-            self._record(spec, before, after, time.monotonic() - started)
+            measurement.measured_mb = self._record(
+                spec, before, after, time.monotonic() - started
+            )
 
     async def _safe_snapshot(self) -> Optional[Snapshot]:
         try:
@@ -434,9 +449,9 @@ class Observer:
             return None
 
     def _record(self, spec, before: Optional[Snapshot], after: Optional[Snapshot],
-                elapsed: float) -> None:
+                elapsed: float) -> Optional[int]:
         if before is None or after is None:
-            return
+            return None
         drift = abs(after.foreign_mb - before.foreign_mb)
         delta = after.device.used_mb - before.device.used_mb
         if drift > FOREIGN_DRIFT_TOLERANCE_MB:
@@ -444,10 +459,10 @@ class Observer:
                 "not recording cost for %s: foreign usage moved %d MiB during the load",
                 spec.tag, drift,
             )
-            return
+            return None
         if delta <= 0:
             log.debug("not recording cost for %s: delta %d MiB", spec.tag, delta)
-            return
+            return None
         key = cost_key(spec)
         prior = self.cache.get(key)
         self.cache.record(key, spec, delta)
@@ -459,6 +474,7 @@ class Observer:
         else:
             log.info("measured %s at %d MiB in %.1fs (first measurement)",
                      spec.tag, delta, elapsed)
+        return delta
 
     async def observe_unload(self, tag: str, before: Optional[Snapshot]) -> None:
         after = await self._safe_snapshot()

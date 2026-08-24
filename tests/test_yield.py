@@ -20,6 +20,7 @@ from vramux.lease import (
     NoRoom,
 )
 from vramux.registry import ModelSpec
+from vramux.residency import InsufficientVRAM
 
 from test_lease import RESERVE, TOTAL, FakeObserver, broker, snapshot
 from test_residency import packing_arbiter, spec
@@ -196,19 +197,18 @@ def arbiter_with_broker(costs, free_mb, b, **kw):
     return sup
 
 
-async def test_admission_asks_when_it_is_short_and_loads_anyway():
-    """The load is not blocked on an answer. Waiting forever for a holder that
-    may never reply turns a cooperative gesture into a hang."""
+async def test_admission_asks_when_short_then_refuses_a_partial_load():
+    """An ignored yield becomes a retryable refusal, not silent CPU offload."""
     b = broker(FakeObserver(), sweep_interval=60)
     batch = await held(b, 8000, "batch", PRIORITY_BATCH)
     sup = arbiter_with_broker({"big:27b": 19000}, 10000, b, yield_wait=0.3)
 
-    await sup.acquire(spec("big:27b"))
-    sup.release("big:27b")
+    with pytest.raises(InsufficientVRAM):
+        await sup.acquire(spec("big:27b"))
 
     assert batch.yield_request is not None, "the holder was asked"
     assert batch.yield_request.by == "serving:big:27b"
-    assert [r.tag for r in sup.residents] == ["big:27b"], "and the load went ahead"
+    assert sup.residents == []
 
 
 async def test_admission_stops_waiting_the_moment_the_memory_comes_back():
@@ -242,8 +242,8 @@ async def test_yield_wait_zero_turns_asking_off_entirely():
     b = broker(FakeObserver(), sweep_interval=60)
     batch = await held(b, 8000, "batch", PRIORITY_BATCH)
     sup = arbiter_with_broker({"big:27b": 19000}, 10000, b, yield_wait=0.0)
-    await sup.acquire(spec("big:27b"))
-    sup.release("big:27b")
+    with pytest.raises(InsufficientVRAM):
+        await sup.acquire(spec("big:27b"))
     assert batch.yield_request is None
 
 
@@ -255,8 +255,8 @@ async def test_a_model_can_outrank_serving_or_duck_under_it():
     sup = arbiter_with_broker({"quiet:9b": 19000}, 10000, b, yield_wait=0.2)
 
     quiet = ModelSpec(tag="quiet:9b", priority=PRIORITY_BATCH)
-    await sup.acquire(quiet)
-    sup.release("quiet:9b")
+    with pytest.raises(InsufficientVRAM):
+        await sup.acquire(quiet)
     assert holder.yield_request is None, "a batch-priority model asks nobody"
 
 
@@ -266,6 +266,6 @@ async def test_a_holder_at_serving_priority_is_never_asked():
     b = broker(FakeObserver(), sweep_interval=60)
     holder = await held(b, 8000, "protected", PRIORITY_INTERACTIVE)
     sup = arbiter_with_broker({"big:27b": 19000}, 10000, b, yield_wait=0.2)
-    await sup.acquire(spec("big:27b"))
-    sup.release("big:27b")
+    with pytest.raises(InsufficientVRAM):
+        await sup.acquire(spec("big:27b"))
     assert holder.yield_request is None

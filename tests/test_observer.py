@@ -21,6 +21,7 @@ from vramux.observer import (
     Snapshot,
     UsageLog,
     cost_key,
+    known_cost_mb,
 )
 from vramux.registry import KIND_DOCKER, ModelSpec
 from vramux.backends import parse_compose_top
@@ -226,6 +227,21 @@ def test_cache_round_trips_and_counts_samples(tmp_path):
     assert entry["previous_mb"] == 6591
     assert entry["samples"] == 2
     assert entry["tag"] == "q:9b" and entry["ctx"] == 16384
+
+
+def test_lower_measurement_cannot_poison_the_high_water_mark(tmp_path):
+    cache = CostCache(tmp_path / "costs.json")
+    s = spec(tag="q:27b", ctx_size=131072)
+    cache.record(cost_key(s), s, 21000)
+    cache.record(cost_key(s), s, 1400)
+    assert cache.get(cost_key(s))["measured_mb"] == 21000
+
+
+def test_declared_cost_is_a_floor_for_measurements(tmp_path):
+    cache = CostCache(tmp_path / "costs.json")
+    s = spec(tag="q:27b", vram_mb=21000)
+    cache.record(cost_key(s), s, 1400)
+    assert known_cost_mb(cache, s) == 21000
 
 
 def test_corrupt_cache_is_ignored_rather_than_fatal(tmp_path):

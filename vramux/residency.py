@@ -45,9 +45,9 @@ log = logging.getLogger("vramux.residency")
 
 
 # How long admission waits for a leaseholder to act on a yield request before
-# loading anyway. Bounded and short: the holder is being asked, not told, and a
-# request that waits minutes for an answer that may never come has turned a
-# cooperative gesture into a hang.
+# returning a retryable refusal. Bounded and short: the holder is being asked,
+# not told, and a request that waits minutes for an answer that may never come
+# has turned a cooperative gesture into a hang.
 DEFAULT_YIELD_WAIT = 30.0
 
 # What serving outranks by default — one step above the lease default, because
@@ -93,6 +93,17 @@ class BackendLoading(RuntimeError):
     Raised instead of waiting forever, so the caller gets a "still loading,
     try again" rather than a socket that never answers.
     """
+
+
+class InsufficientVRAM(BackendLoading):
+    """A known model footprint does not fit in the currently free budget."""
+
+
+class PartialOffload(BackendLoading):
+    """A backend started but used far less GPU memory than its declared floor."""
+
+
+MIN_DECLARED_FOOTPRINT_RATIO = 0.90
 
 
 @dataclass
@@ -480,15 +491,11 @@ class ResidencyArbiter:
     async def _ask_leases_to_yield(self, spec: ModelSpec) -> None:
         """Ask leaseholders below this model's priority for the shortfall.
 
-        Bounded, voluntary, and it never runs when it cannot help: no yield
-        callable, no budget, no measured cost, or nothing actually short means
-        this returns immediately and the load proceeds exactly as it did
-        before. Nothing here revokes anything — the wait ends and the load goes
-        ahead regardless, which is the same thing that happened before yield
-        existed, only now the holder was told.
+        Bounded and voluntary: nothing here revokes a lease. If the known
+        footprint still does not fit, refuse this request rather than letting
+        llama-server auto-fit a CPU-heavy backend that stays degraded after
+        the card becomes free.
         """
-        if self._request_yield is None or self.yield_wait <= 0:
-            return
         cost = self._cost_mb(spec)
         if cost is None or self._budget is None:
             return
@@ -840,12 +847,27 @@ class ResidencyArbiter:
             if self.observer is None:
                 await backend.start(spec, budget)
             else:
-                async with self.observer.measuring(spec):
+                async with self.observer.measuring(spec) as measurement:
                     await backend.start(spec, budget)
                     # Claim before the window closes, or the process we just
                     # started reads as foreign drift and voids its own
                     # measurement.
                     self.observer.claim(spec.tag, await self._backend_pids(backend))
+                declared = spec.vram_mb
+                # Third-party/test observers written before measurement
+                # results were exposed may yield no result object. Observation
+                # remains optional; absence must not break an otherwise valid
+                # load.
+                measured = getattr(measurement, "measured_mb", None)
+                if (
+                    declared
+                    and measured is not None
+                    and measured < int(declared * MIN_DECLARED_FOOTPRINT_RATIO)
+                ):
+                    raise PartialOffload(
+                        f"{spec.tag} started with only {measured} MiB on the GPU; "
+                        f"its declared floor is {declared} MiB"
+                    )
         except Exception:
             await self._stop_resident(resident)
             raise
