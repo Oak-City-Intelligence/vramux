@@ -556,6 +556,66 @@ class ResidencyArbiter:
             await self._evict(resident)
             return True
 
+    def _effective_priority(self, resident: Resident) -> int:
+        """What this resident outranks: its own say-so, else serving's."""
+        priority = resident.spec.priority
+        return priority if priority is not None else self.serving_priority
+
+    async def make_room_for_lease(self, mb: int, by: str, priority: int) -> int:
+        """Evict managed residents below `priority` until `mb` MiB is freed.
+
+        The broker calls this — injected, never imported — when a lease is
+        short on budget. It is the §3 tier table finally wired to leases:
+        managed consumers are the tier vramux may evict silently, and until
+        now only serving ever exercised that. The rule is the mirror image of
+        `_ask_leases_to_yield`: a lease may evict a resident whose effective
+        priority is *strictly below* its own, so a default lease (5) against
+        default serving (7) evicts nothing and behaves exactly as before.
+
+        Victims go cheapest-first among the eligible — the same reasoning
+        `request_yield` gives: freeing a 2 GB embedder must be tried before a
+        20 GB chat model when 2 GB covers the shortfall. Each one drains
+        before it stops, exactly as a serving-side eviction would.
+
+        Returns the number of residents evicted, not megabytes: a resident
+        nobody has measured frees an amount only the card can report, and the
+        caller re-reads the budget anyway. The count is the honest answer to
+        the one question the caller has — did anything change.
+        """
+        mb = max(0, int(mb))
+        if mb <= 0:
+            return 0
+        evicted = 0
+        freed = 0
+        async with self._lock:
+            while freed < mb:
+                eligible = [
+                    r for r in self._residents.values()
+                    if self._effective_priority(r) < priority
+                ]
+                if not eligible:
+                    break
+                costs = {r.tag: self._cost_mb(r.spec) for r in eligible}
+                victim = min(
+                    eligible,
+                    key=lambda r: (costs[r.tag] is None, costs[r.tag] or 0),
+                )
+                cost = costs[victim.tag]
+                log.info(
+                    "evicting %s (%s MiB) for lease %s (priority %d over %d)",
+                    victim.tag,
+                    cost if cost is not None else "unmeasured",
+                    by, priority, self._effective_priority(victim),
+                )
+                await self._evict(victim)
+                evicted += 1
+                if cost is None:
+                    # What came back is the card's to say, not ours to count.
+                    # Stop here and let the caller's re-read decide.
+                    break
+                freed += cost
+        return evicted
+
     def _make_backend(self, spec: ModelSpec, port: Optional[int]) -> Backend:
         if spec.kind == KIND_DOCKER:
             return DockerComposeBackend(spec)

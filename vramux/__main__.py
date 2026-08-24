@@ -66,6 +66,9 @@ def _serve(args: argparse.Namespace) -> None:
     # The other half of tier 3: residency can stop what it started, and asking
     # a leaseholder to give memory back is the only move it has left.
     arbiter.use_yield(broker.request_yield)
+    # And tier 1 read from the lease's side: a lease that outranks a resident
+    # may have it evicted — its own children are the one thing vramux can stop.
+    broker.use_make_room(arbiter.make_room_for_lease)
     app = make_app(registry, arbiter, broker)
     web.run_app(app, host=args.host, port=args.port, print=None)
 

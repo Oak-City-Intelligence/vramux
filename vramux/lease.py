@@ -323,6 +323,11 @@ class Broker:
         self.poll_interval = poll_interval
         self._loading = loading
         self._parent_of = parent_of
+        # Residency's `make_room_for_lease()`, injected the same way `loading`
+        # is and for the same reason: the broker must not import residency.
+        # None — the default, and the state in any embedding that never wires
+        # it — means a short lease waits and asks exactly as it always did.
+        self._make_room = None
         self._leases: Dict[str, Lease] = {}
         self._lock = asyncio.Lock()
         self._timer: Optional[asyncio.Task] = None
@@ -336,6 +341,15 @@ class Broker:
         self._blocked_short_mb = 0
 
     # ---- what is held ---------------------------------------------------------
+
+    def use_make_room(self, make_room) -> None:
+        """Hand the broker residency's `make_room_for_lease()`.
+
+        Same shape as residency's `use_budget`/`use_yield`, going the other
+        way: one callable each direction rather than two modules importing
+        one another.
+        """
+        self._make_room = make_room
 
     @property
     def leases(self) -> List[Lease]:
@@ -445,6 +459,7 @@ class Broker:
 
         deadline = time.monotonic() + wait
         last_log = time.monotonic()
+        asked_to_evict = False
         asked_to_yield = False
         while True:
             async with self._lock:
@@ -454,6 +469,14 @@ class Broker:
                 blocked = self._blocked_reason
                 short = self._blocked_short_mb
             now = time.monotonic()
+            if not asked_to_evict and short > 0 and now < deadline:
+                # Eviction goes before yield, and once per acquire like it:
+                # a managed resident pays a reload later, while a yielding
+                # leaseholder stops running work now. The cheap disruption
+                # first, and it often makes the expensive ask unnecessary.
+                asked_to_evict = True
+                if await self._evict_for(short, owner, priority):
+                    continue  # room may already be back — regrant before asking
             if not asked_to_yield and short > 0 and now < deadline:
                 # Once per acquire, not once per poll: a waiting request that
                 # re-asks every two seconds is a holder being nagged, and the
@@ -471,6 +494,22 @@ class Broker:
                 last_log = now
                 log.info("lease for %s waiting: %s", owner, blocked)
             await asyncio.sleep(min(self.poll_interval, max(0.05, deadline - now)))
+
+    async def _evict_for(self, short: int, owner: str, priority: int) -> int:
+        """Ask residency to evict managed models below `priority` for `short`.
+
+        Returns how many residents were evicted — zero when nothing was
+        eligible, nothing is wired, or residency failed. Failure degrades to
+        the wait-then-ask behavior this feature was added on top of; a broken
+        residency layer must never take a lease request down with it.
+        """
+        if self._make_room is None:
+            return 0
+        try:
+            return int(await self._make_room(short, f"lease:{owner}", priority))
+        except Exception as exc:  # noqa: BLE001 — degrade, never propagate
+            log.warning("could not evict for lease %s: %s", owner, exc)
+            return 0
 
     async def _try_grant(
         self, mb: int, owner: str, ttl: float, priority: int, pids: Sequence[int]

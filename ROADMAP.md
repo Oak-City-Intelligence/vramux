@@ -608,6 +608,40 @@ touching the running service. 10 tests came with it.
 else, and giving it a second transport to draw a chart at 5 s samples in
 `curses` buys less than it costs.
 
+## Stage 8 — A lease can evict a model — DONE (2026-08-24)
+
+Spec: `specs/lease-evicts-managed.md`. The §3 tier table finally wired to
+leases: managed consumers were always the tier vramux may evict silently, and
+until now only serving ever exercised it. A short lease that waits and
+*outranks* an idle resident — strictly above its `priority:`, else
+`VRAMUX_SERVING_PRIORITY` — has it drained and evicted instead of waiting out
+a 15-minute idle timer or making the client hand-call `/gpu/evict` first,
+which is what every serious lease client had learned to do.
+
+What landed:
+
+- `ResidencyArbiter.make_room_for_lease(mb, by, priority)` — cheapest-first
+  among eligible residents, drain-first via the same `_evict` a swap uses,
+  stops when the measured cost covers the shortfall. Returns the eviction
+  *count*, not megabytes: an unmeasured victim frees an amount only the card
+  can report, so counting stops there and the caller re-reads the budget.
+- `Broker.use_make_room()` — wired in `__main__.py` beside `use_budget` /
+  `use_yield`, the same one-callable-each-way shape, so the broker still
+  never imports residency and a bare `Broker` behaves exactly as before.
+- In `Broker.acquire`: evict once per acquire, *before* yield — eviction
+  costs its victim a reload later, yield stops running work now, and the
+  cheap disruption often makes the expensive ask unnecessary.
+- No new configuration. The gate is the priority pair already in every
+  request and every model entry, and it defaults closed: lease 5 < serving 7.
+
+12 tests (`test_lease_evict.py`); the compatibility half of the suite pins
+that a default-priority lease, a `wait: 0` lease, an unwired broker, and a
+residency layer that raises all leave the world exactly as Stage 4 built it.
+
+This also part-answers the standing open item below — *whether anything
+should enforce priority*: for managed residents, yes, eviction; for everyone
+else, still nothing takes.
+
 ---
 
 ## Working around a busy GPU

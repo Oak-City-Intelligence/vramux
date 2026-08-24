@@ -174,6 +174,17 @@ under a live holder is a bug in that holder, and silence would hide it.
 `413` versus `408` matters: asking for more than the card can ever provide is a
 configuration error and should fail immediately, not block for two minutes first.
 
+A lease that does not fit and is willing to wait gets two things tried on its
+behalf, in this order: managed residents whose effective priority sits
+*strictly below* the lease's are drained and evicted — the §3 tier table read
+from the lease's side, since evicting its own children silently is the one
+power vramux has always claimed — and then leaseholders below it are asked to
+yield (§6.2). Eviction before yield because eviction is free to its victim in
+every sense that matters, a reload later, while yield interrupts running
+work. A model's effective priority is `priority:` from its config, else
+`VRAMUX_SERVING_PRIORITY`; the default lease priority (5) therefore evicts
+nothing, and the feature is asked for per request by outranking the resident.
+
 ### 5.1 Broker restart, and why dropping leases is safe
 
 On restart vramux drops every lease. It does not persist them. This is correct

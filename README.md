@@ -266,6 +266,14 @@ The rules worth knowing before writing a client:
 - **A restart drops every lease and frees nothing.** Holders demote to foreign:
   vramux stops knowing whose memory that is, still sees it, and still subtracts
   it. The budget stays true, which is the invariant that matters.
+- **A lease above a model's priority may evict it.** A short lease that waits
+  (`wait` > 0) and outranks an idle resident — models sit at
+  `VRAMUX_SERVING_PRIORITY` (7) unless `models.yml` says otherwise — has it
+  drained and unloaded rather than waiting out its idle timer. The model pays
+  a reload later and loses nothing; that is what the managed tier means. The
+  default lease priority (5) outranks no model, so a client that never asks
+  for more sees no change. Pin a model against this with `priority:` in its
+  config.
 
 Nothing needs a lease to be served a model. Consumers that have not migrated
 are foreign, which is a correct state and not a broken one.
