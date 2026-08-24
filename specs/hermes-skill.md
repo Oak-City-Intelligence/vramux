@@ -1,6 +1,10 @@
 # Spec: a published hermes skill for vramux
 
-Status: spec. Not built. Depends on both companion specs
+Status: BUILT 2026-08-24 — `examples/hermes/vramux/` (SKILL.md + README.md).
+The acceptance run below still stands as the live checklist; it needs the
+serving process restarted onto Stages 8–9 first.
+
+Original text follows. It depended on both companion specs
 (`lease-evicts-managed.md`, `serving-queue.md`) — without them the skill
 would have to teach the evict-first dance and mid-generation turns would
 die on 503s, and a published skill must not encode workarounds for bugs we
