@@ -28,6 +28,7 @@ from .registry import ModelRegistry
 from .router import make_app
 from .residency import (
     DEFAULT_MAX_RESIDENTS,
+    DEFAULT_QUEUE_WAIT,
     DEFAULT_SERVING_PRIORITY,
     DEFAULT_YIELD_WAIT,
     ResidencyArbiter,
@@ -48,6 +49,7 @@ def _serve(args: argparse.Namespace) -> None:
         max_residents=args.max_residents,
         yield_wait=args.yield_wait,
         serving_priority=args.serving_priority,
+        queue_wait=args.queue_wait,
     )
     # `loading` rather than the arbiter itself: the broker needs to know a load
     # is in flight — it has not allocated yet, so the card reads freer than it
@@ -69,6 +71,10 @@ def _serve(args: argparse.Namespace) -> None:
     # And tier 1 read from the lease's side: a lease that outranks a resident
     # may have it evicted — its own children are the one thing vramux can stop.
     broker.use_make_room(arbiter.make_room_for_lease)
+    # The last pairing: a refused load's one remaining question — is the
+    # memory held by leases that outrank me, worth parking behind — is the
+    # broker's to answer.
+    arbiter.use_outrankers(broker.outrankers)
     app = make_app(registry, arbiter, broker)
     web.run_app(app, host=args.host, port=args.port, print=None)
 
@@ -168,10 +174,14 @@ def main() -> None:
     parser.add_argument("--yield-wait", type=float,
                         default=env.get_float("YIELD_WAIT", DEFAULT_YIELD_WAIT),
                         help="seconds admission waits for a leaseholder to yield "
-                             "before loading anyway; 0 disables asking")
+                             "before refusing the load; 0 disables asking")
     parser.add_argument("--serving-priority", type=int,
                         default=env.get_int("SERVING_PRIORITY", DEFAULT_SERVING_PRIORITY),
                         help="what serving outranks; higher wins, leases default to 5")
+    parser.add_argument("--queue-wait", type=float,
+                        default=env.get_float("QUEUE_WAIT", DEFAULT_QUEUE_WAIT),
+                        help="seconds an outranked load request parks behind a "
+                             "higher-priority lease before refusing; 0 fails fast")
     parser.add_argument("--sample-interval", type=float,
                         default=env.get_float("SAMPLE_INTERVAL", SAMPLE_INTERVAL),
                         help="seconds between usage-history samples")

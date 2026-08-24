@@ -642,6 +642,41 @@ This also part-answers the standing open item below — *whether anything
 should enforce priority*: for managed residents, yes, eviction; for everyone
 else, still nothing takes.
 
+## Stage 9 — Serving queues behind a lease it does not outrank — DONE (2026-08-24)
+
+Spec: `specs/serving-queue.md`. Stage 8's rule read back from serving's
+side, and the half that makes the pair usable on an agent machine: a lease
+taken above serving's priority exists precisely so the card is not disturbed
+mid-generation, and a chat request arriving during it is not failing — it is
+*outranked*. It used to get a hard 503 after `yield_wait`; most
+OpenAI-compatible clients surface that as a failed turn, so the one client
+the machine runs all day could not survive the one state the machine was
+designed to be in. Now it parks: slow first token, same connection, no error.
+
+What landed:
+
+- `Broker.outrankers(priority)` — the leases at or above a priority, each
+  with `mb` (the larger of grant and observed) and `remaining_s` to expiry.
+  Injected into residency as `use_outrankers`, the fourth and last pairing.
+- `ResidencyArbiter._park_behind_leases` — entered from every refusal site
+  in `_ask_leases_to_yield`, and deliberately narrow: it parks only when the
+  blockers outrank the model AND releasing them would make the load fit.
+  Foreign growth, an unco-operative peer below serving, a cost that never
+  fits — all still refuse exactly as before.
+- Bounded twice: `VRAMUX_QUEUE_WAIT` (default 600, `0` restores fail-fast)
+  is a hard cap renewals cannot push past, and the blocking lease's own TTL
+  plus a sweep-width grace bounds it from the other side — TTL being
+  mandatory is what makes the wait a promise rather than a hope.
+- Honest while parked: the load registers as in flight with a `behind`
+  field, so `/gpu/state`, the admission wait message a second caller gets,
+  and the cadence log all say "queued behind lease X", not "still loading".
+  A client that disconnects abandons the park, surrenders the lock, and
+  leaves no phantom load.
+
+10 tests (`test_serving_queue.py`). With Stage 8 this closes the open item
+below: priority is enforced by eviction for vramux's own children and by
+patience for everyone else, and nothing anywhere revokes or takes.
+
 ---
 
 ## Working around a busy GPU
@@ -688,4 +723,6 @@ subject.
 ## Open
 
 - Multi-GPU placement policy (device index threaded through, nothing designed)
-- Whether anything should *enforce* priority. Yield asks; nothing takes
+- ~~Whether anything should *enforce* priority~~ — **answered at Stages 8–9**:
+  eviction for vramux's own children, patience for everyone else. Yield still
+  asks; nothing anywhere takes

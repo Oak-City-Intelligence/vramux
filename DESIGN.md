@@ -185,6 +185,23 @@ work. A model's effective priority is `priority:` from its config, else
 `VRAMUX_SERVING_PRIORITY`; the default lease priority (5) therefore evicts
 nothing, and the feature is asked for per request by outranking the resident.
 
+The same rule read from serving's side: a model load blocked by leases it
+does not outrank *parks* — up to `VRAMUX_QUEUE_WAIT`, and never past the
+blocking lease's own TTL horizon — rather than erroring, because the operator
+who took a lease above serving arranged exactly that. It parks only when
+releasing the outrankers would make the load fit; every other shortfall
+refuses as before. Priority is then one story in four rows:
+
+| requester | blocker | outcome |
+|---|---|---|
+| lease p8 | resident p7 | resident drained and evicted |
+| serving p7 | lease p8 | serving parks until release, expiry, or the cap |
+| serving p7 | lease p5 | lease asked to yield, then refuse |
+| lease p5 | resident p7 | wait, then `NoRoom` |
+
+Nothing anywhere revokes or takes: enforcement is eviction for vramux's own
+children, and patience for everyone else.
+
 ### 5.1 Broker restart, and why dropping leases is safe
 
 On restart vramux drops every lease. It does not persist them. This is correct

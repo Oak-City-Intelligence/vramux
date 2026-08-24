@@ -58,6 +58,20 @@ DEFAULT_SERVING_PRIORITY = 7
 # How often the budget is re-read while waiting for a yield.
 _YIELD_POLL = 1.0
 
+# How long an outranked load request parks, waiting for the lease above it to
+# release or expire, before refusing. The park is safe to promise because TTL
+# is mandatory: the blocker *will* end, and the broker knows the latest moment
+# it can. 0 restores the old behavior — refuse the moment yield concludes.
+DEFAULT_QUEUE_WAIT = 600.0
+
+# How often the budget is re-read while parked behind a lease.
+_PARK_POLL = 1.0
+
+# Slack past a blocking lease's expiry before a parked request gives up on it:
+# expiry is enforced by a sweep, not at the instant, and giving up in the gap
+# between the two would fail a request the very moment its memory came back.
+_PARK_GRACE = 10.0
+
 # Ceiling on residents, whatever the budget says. The budget is the real
 # constraint; this is a bound on how many upstream ports and backend processes
 # one card is allowed to sprout, and a place to stand if packing ever turns
@@ -109,11 +123,17 @@ class Resident:
 
 @dataclass
 class Loading:
-    """A load in progress, so a waiter can report a wait instead of a silence."""
+    """A load in progress, so a waiter can report a wait instead of a silence.
+
+    `behind` is set when this is not a load at all but a park: the model is
+    queued behind a lease that outranks it, and every message about the wait
+    should say so rather than describing a load that is not happening.
+    """
 
     tag: str
     started: float
     budget: float
+    behind: Optional[str] = None
 
     @property
     def elapsed(self) -> float:
@@ -141,6 +161,8 @@ class ResidencyArbiter:
         request_yield=None,
         yield_wait: float = DEFAULT_YIELD_WAIT,
         serving_priority: int = DEFAULT_SERVING_PRIORITY,
+        outrankers=None,
+        queue_wait: float = DEFAULT_QUEUE_WAIT,
     ) -> None:
         self.host = host
         self.port = port
@@ -160,6 +182,13 @@ class ResidencyArbiter:
         self.yield_wait = max(0.0, float(yield_wait))
         # What serving outranks when a model does not name its own priority.
         self.serving_priority = serving_priority
+        # The broker's `outrankers()`, injected like the two above. It answers
+        # the one question a refused load has left: is the memory held by
+        # leases that outrank me — which will end, and are worth waiting for —
+        # or by something waiting can never fix. None disables parking, which
+        # is what every test written before the queue existed gets.
+        self._outrankers = outrankers
+        self.queue_wait = max(0.0, float(queue_wait))
         # Consecutive upstream ports, one per possible llama-server. Containers
         # publish their own and never take one.
         self._free_ports: List[int] = [port + i for i in range(self.max_residents)]
@@ -189,6 +218,10 @@ class ResidencyArbiter:
         rather than two modules importing one another.
         """
         self._request_yield = request_yield
+
+    def use_outrankers(self, outrankers) -> None:
+        """Hand residency the broker's `outrankers()`. Same shape, same reason."""
+        self._outrankers = outrankers
 
     def use_budget(self, budget) -> None:
         """Hand residency the broker's `budget()`.
@@ -259,11 +292,18 @@ class ResidencyArbiter:
         load = self._loading
         if load is None:
             return None
-        return {
+        payload = {
             "tag": load.tag,
             "elapsed_s": round(load.elapsed, 1),
             "budget_s": round(load.budget, 1),
         }
+        if load.behind is not None:
+            # Not loading at all: queued behind a lease that outranks it. The
+            # console needs the difference — a card that looks idle while
+            # requests stack up behind a lease is exactly the "where did my
+            # memory go" moment `/gpu/state` exists for.
+            payload["behind"] = load.behind
+        return payload
 
     # ---- startup --------------------------------------------------------------
 
@@ -380,6 +420,11 @@ class ResidencyArbiter:
         load = self._loading
         if load is None:
             return f"the GPU is busy and did not free up within {bound:.0f}s"
+        if load.behind is not None:
+            return (
+                f"{load.tag} is queued behind {load.behind} "
+                f"({load.elapsed:.0f}s of a {load.budget:.0f}s cap) — try again shortly"
+            )
         return (
             f"{load.tag} is still loading after {load.elapsed:.0f}s "
             f"(budget {load.budget:.0f}s) — try again shortly"
@@ -391,6 +436,11 @@ class ResidencyArbiter:
             load = self._loading
             if load is None:
                 log.info("waiting for the GPU to free up")
+            elif load.behind is not None:
+                log.info(
+                    "waiting: %s is queued behind %s (%.0fs of a %.0fs cap)",
+                    load.tag, load.behind, load.elapsed, load.budget,
+                )
             else:
                 log.info(
                     "waiting: %s is still loading (%.0fs of a %.0fs budget)",
@@ -450,11 +500,18 @@ class ResidencyArbiter:
         short = cost - budget.free_mb
         if short <= 0:
             return
+        reason = f"{spec.tag} needs {cost} MiB but only {budget.free_mb} MiB is free"
+        if self._request_yield is None or self.yield_wait <= 0:
+            await self._park_behind_leases(spec, cost, reason)
+            return
         priority = spec.priority if spec.priority is not None else self.serving_priority
         asked = await self._request_yield(
             short, f"serving:{spec.tag}", priority, self.yield_wait,
         )
         if not asked:
+            # Nobody below this model's priority holds anything — which is
+            # exactly the state a park exists for: the memory is above it.
+            await self._park_behind_leases(spec, cost, reason)
             return
         log.info(
             "%s needs %d MiB more than is free; asked %d lease(s) to yield, "
@@ -470,10 +527,100 @@ class ResidencyArbiter:
             if cost <= budget.free_mb:
                 log.info("%s: the memory came back, %d MiB free", spec.tag, budget.free_mb)
                 return
-        log.warning(
-            "%s: nothing yielded within %.0fs, loading into %d MiB anyway",
-            spec.tag, self.yield_wait, budget.free_mb,
+        await self._park_behind_leases(
+            spec, cost,
+            f"{spec.tag} needs {cost} MiB but only {budget.free_mb} MiB is free "
+            f"after waiting {self.yield_wait:.0f}s for a lease to yield",
         )
+
+    async def _park_behind_leases(self, spec: ModelSpec, cost: int, reason: str) -> None:
+        """Wait for the leases outranking this model to release or expire.
+
+        The one shortfall that is not an error: a lease above serving's
+        priority holds the card, and the operator arranged that ranking on
+        purpose. A chat request arriving mid-generation is not failing — it is
+        outranked, and the correct behavior is to wait its turn. Two facts
+        make the wait safe to promise: TTL is mandatory, so the blocker *will*
+        end and `outrankers()` reports the latest moment it can; and this
+        parks only when releasing the outrankers would actually make the load
+        fit — every other cause raises `InsufficientVRAM` exactly as it did
+        before the queue existed.
+
+        Holds the arbiter lock deliberately. No other model could be served
+        anyway — the card is spoken for — and a second request stacking on
+        `_admit` gets the honest queue message and a bounded timeout for free,
+        instead of independently discovering the lease.
+        """
+        if self.queue_wait <= 0 or self._outrankers is None or self._budget is None:
+            raise InsufficientVRAM(reason)
+        priority = spec.priority if spec.priority is not None else self.serving_priority
+        started = time.monotonic()
+        hard_cap = started + self.queue_wait
+        previous = self._loading
+        behind = None
+        last_log = started
+        try:
+            while True:
+                try:
+                    budget = await self._budget()
+                except Exception as exc:
+                    raise InsufficientVRAM(
+                        f"{reason} (and the budget became unreadable while queued: {exc})"
+                    ) from None
+                if cost <= budget.free_mb:
+                    if behind is not None:
+                        log.info(
+                            "%s: the card came back after %.0fs queued",
+                            spec.tag, time.monotonic() - started,
+                        )
+                    return
+                try:
+                    blockers = await self._outrankers(priority)
+                except Exception as exc:
+                    log.warning("could not read the leases while queued: %s", exc)
+                    blockers = []
+                short = cost - budget.free_mb
+                if sum(b["mb"] for b in blockers) < short:
+                    # Releasing every outranker would still not fit the load:
+                    # foreign grew, or the memory was never theirs. Waiting
+                    # cannot help, so this is the old refusal, not a queue.
+                    raise InsufficientVRAM(reason)
+                now = time.monotonic()
+                biggest = max(blockers, key=lambda b: b["mb"])
+                # Never past the moment the last blocker must renew or die. A
+                # renewal pushes the horizon out; nothing pushes it past the cap.
+                deadline = min(
+                    hard_cap,
+                    now + max(b["remaining_s"] for b in blockers) + _PARK_GRACE,
+                )
+                if now >= deadline:
+                    raise InsufficientVRAM(
+                        f"{spec.tag} needs {cost} MiB; lease {biggest['id']} "
+                        f"({biggest['owner']}, priority {biggest['priority']}, "
+                        f"ttl {biggest['remaining_s']:.0f}s) holds the card and "
+                        f"outranks serving — gave up after {now - started:.0f}s queued"
+                    )
+                if behind is None:
+                    behind = f"lease {biggest['id']} ({biggest['owner']})"
+                    self._loading = Loading(
+                        tag=spec.tag, started=started,
+                        budget=self.queue_wait, behind=behind,
+                    )
+                    log.info(
+                        "%s is queued behind %s — outranked, waiting up to %.0fs",
+                        spec.tag, behind, self.queue_wait,
+                    )
+                if now - last_log >= _WAIT_LOG_INTERVAL:
+                    last_log = now
+                    log.info(
+                        "queued: %s behind %s (%.0fs of ttl left)",
+                        spec.tag, behind, biggest["remaining_s"],
+                    )
+                await asyncio.sleep(min(_PARK_POLL, max(0.05, deadline - now)))
+        finally:
+            # A parked request that returns, refuses, or is cancelled by its
+            # client disconnecting must not leave a phantom load behind.
+            self._loading = previous
 
     def _must_be_alone(self, spec: ModelSpec) -> Optional[str]:
         """Why `spec` cannot share the card, or None if it can.

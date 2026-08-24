@@ -108,8 +108,9 @@ documents both backend kinds.
 | `VRAMUX_CACHE_DIR` | `~/.cache/vramux` | where measured costs and usage history are written |
 | `VRAMUX_RESERVE_MB` | `1024` | headroom held back from every lease |
 | `VRAMUX_MAX_RESIDENTS` | `2` | ceiling on models resident at once; the budget is the real limit |
-| `VRAMUX_YIELD_WAIT` | `30` | seconds admission waits for a leaseholder to yield before loading anyway; `0` disables asking |
+| `VRAMUX_YIELD_WAIT` | `30` | seconds admission waits for a leaseholder to yield before refusing the load; `0` disables asking |
 | `VRAMUX_SERVING_PRIORITY` | `7` | what serving outranks; higher wins, leases default to 5 |
+| `VRAMUX_QUEUE_WAIT` | `600` | seconds an outranked load request parks behind a higher-priority lease before refusing; `0` fails fast |
 | `VRAMUX_SAMPLE_INTERVAL` | `300` | seconds between usage-history samples; clamped up to the 5 s lease sweep it rides on |
 | `VRAMUX_EVENT_INTERVAL` | `1` | seconds between readings while a console is watching; nothing is read when none is |
 | `VRAMUX_EVENT_KEEPALIVE` | `15` | seconds of an unchanged card before the event stream sends a comment line |
@@ -274,6 +275,13 @@ The rules worth knowing before writing a client:
   default lease priority (5) outranks no model, so a client that never asks
   for more sees no change. Pin a model against this with `priority:` in its
   config.
+- **A lease above serving's priority makes serving wait** — which is the
+  point: take one when the card must not be disturbed. A model load that
+  arrives while such a lease holds the room parks instead of erroring, up to
+  `VRAMUX_QUEUE_WAIT` and never past the lease's own TTL horizon; the caller
+  sees a slow first token, not a 503. It parks only when releasing the
+  outranking leases would actually make the load fit — every other shortfall
+  still refuses exactly as before.
 
 Nothing needs a lease to be served a model. Consumers that have not migrated
 are foreign, which is a correct state and not a broken one.

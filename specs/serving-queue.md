@@ -1,8 +1,14 @@
 # Spec: serving queues behind a higher-priority lease
 
-Status: spec. Not built.
+Status: BUILT 2026-08-24 (ROADMAP Stage 9). Two deviations from the text
+below: the park polls the injected budget on its own 1 s cadence rather than
+riding the 5 s lease sweep (same rhythm as the yield wait, and a parked
+agent turn should not pay five extra seconds of latency for machinery
+thrift); and park visibility rides the existing `loading` block on
+`/gpu/state` — with a `behind` field — rather than a new `queued` block,
+since every consumer of "is the card busy" already reads `loading`.
 Companion: `specs/lease-evicts-managed.md` — one priority rule, two
-directions. Build that one first.
+directions. That one landed first, as Stage 8.
 
 ## Problem
 

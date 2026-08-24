@@ -424,6 +424,38 @@ class Broker:
             )
         return _with_account(lease, self._account_for(lease, snapshot))
 
+    async def outrankers(self, priority: int) -> List[dict]:
+        """The leases at or above `priority`: who outranks, and by how much.
+
+        Residency's half of the queue decision — injected, never imported. A
+        refused load has one question left: is the memory held by leases that
+        outrank it, which will end and are worth waiting for, or by something
+        waiting can never fix. `mb` is the larger of the grant and what the
+        holder is observed using, since either bounds what release would give
+        back; `remaining_s` is how long until the lease must renew or die,
+        which is what bounds how long anything should wait on it.
+        """
+        try:
+            snapshot = await self.observer.snapshot()
+        except Exception:  # noqa: BLE001 — an unreadable card degrades to grants
+            snapshot = None
+        now = time.monotonic()
+        rows = []
+        for lease in self._leases.values():
+            if lease.priority < priority:
+                continue
+            observed = (
+                self._observed_for(snapshot, lease.pids) if snapshot is not None else 0
+            )
+            rows.append({
+                "id": lease.id,
+                "owner": lease.owner,
+                "priority": lease.priority,
+                "mb": max(lease.mb, observed),
+                "remaining_s": max(0.0, lease.expires_at - now),
+            })
+        return rows
+
     def _observed_for(self, snapshot, pids: Sequence[int]) -> int:
         return budget_mod.observed_mb(
             snapshot,
