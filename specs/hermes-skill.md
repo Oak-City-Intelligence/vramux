@@ -1,8 +1,10 @@
 # Spec: a published hermes skill for vramux
 
 Status: BUILT 2026-08-24 — `examples/hermes/vramux/` (SKILL.md + README.md).
-The acceptance run below still stands as the live checklist; it needs the
-serving process restarted onto Stages 8–9 first.
+The acceptance run below still stands as the live checklist; the serving
+process now runs Stages 8–9, and the core loop — a lease evicting the
+resident model, generation parking behind it and resuming — has been
+exercised live end to end.
 
 Original text follows. It depended on both companion specs
 (`lease-evicts-managed.md`, `serving-queue.md`) — without them the skill

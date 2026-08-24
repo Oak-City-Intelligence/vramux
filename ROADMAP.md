@@ -124,7 +124,6 @@ It lives at its final address from day one and is the thing actually running the
 whole time. There is never a moment where it gets "turned around and installed" —
 it was never anywhere else.
 
-Match how the neighbouring repos wire into the shared git hooks.
 
 ### 1b. Identity
 
@@ -567,7 +566,7 @@ Verified live, both directions:
 |---|---|
 | a 16 000 MiB batch lease, then a model needing 272 MiB more | asked for **272 MiB**, not the model's whole cost |
 | the holder releasing | "the memory came back, 22 319 MiB free", load resumed in 13 s |
-| a holder that ignored it | "nothing yielded within 30s, loading into 2 319 MiB anyway", then one warning naming the holder |
+| a holder that ignored it | "nothing yielded within 30s", then one warning naming the holder — at the time the load went ahead anyway; that ending has since become a retryable refusal |
 | `vramux lease --on-yield term` | forwarded SIGTERM to its command, which exited and released — the whole cooperative loop, end to end |
 | `vramux top` during a request | the lease row went red with "asked for 4 273 MiB by serving:qwen3.5:9b — 23s left" |
 

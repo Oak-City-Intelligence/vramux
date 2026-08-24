@@ -43,9 +43,13 @@ discussion; they will not be treated as vulnerabilities.
 
 - **Lease denial-of-service is trivial and unmitigated.** One client can take
   a lease covering most of the card and renew it forever, and nothing arbitrates
-  between holders. A `priority` field is accepted and currently means nothing.
-  This is acceptable on a box with one operator and is a direct reason vramux
-  is not a multi-tenant tool.
+  between holders. `priority` makes this sharper, not safer: a high-priority
+  lease can have a resident model evicted for it, and can make new loads park
+  behind it for up to `VRAMUX_QUEUE_WAIT`. That grants no capability the port
+  did not already grant — anything reaching it could always call `/gpu/evict`
+  by hand — but priority is a lever, not a label, and nothing authenticates
+  who pulls it. This is acceptable on a box with one operator and is a direct
+  reason vramux is not a multi-tenant tool.
 
 - **A lease is a promise, not a fence.** vramux reserves memory in its own
   accounting; it does not stop an unmigrated consumer from allocating it

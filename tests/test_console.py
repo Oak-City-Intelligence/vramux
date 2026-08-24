@@ -37,7 +37,7 @@ def state(**overrides) -> dict:
         "recognised_mb": 13599,
         "foreign_mb": 410,
         "processes": [
-            {"pid": 2185, "used_mb": 240, "name": "/usr/bin/kwin_wayland", "owner": None},
+            {"pid": 2185, "used_mb": 240, "name": "/usr/bin/compositor", "owner": None},
             {"pid": 999, "used_mb": 9000, "name": "llama-server", "owner": "a:9b"},
         ],
         "unlocated_owners": [],
@@ -124,7 +124,7 @@ def test_only_foreign_processes_are_listed_as_foreign():
     it under FOREIGN would double it in the reader's head, having already been
     counted as a resident above."""
     drawn = text(render(state(), width=100))
-    assert "kwin_wayland" in drawn
+    assert "compositor" in drawn
     assert "llama-server" not in drawn
 
 

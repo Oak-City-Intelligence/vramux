@@ -109,10 +109,10 @@ cache. It moves without warning, and a stale read is exactly the case that OOMs.
 Admission needs to know a cost before the allocation exists. Three sources, in
 order of preference:
 
-1. **Measured.** vramux recorded what this exact configuration actually used
-   last time. Authoritative.
-2. **Declared.** `vram_mb:` in config. Required for container backends — their
-   internals are not introspectable.
+1. **Measured.** vramux retains the high-water mark for what this exact
+   configuration actually used.
+2. **Declared.** `vram_mb:` in config. A hard floor on measurements, and
+   required for container backends whose internals are not introspectable.
 3. **Estimated.** Computed for local model files from header metadata:
 
    ```
@@ -319,6 +319,16 @@ evicts every managed resident and blocks on all leases. A 20 GB model on a 24 GB
 card is exclusive in practice, and declaring it is cheaper than discovering it
 through a failed cost estimate.
 
+### 6.1 The in-flight problem
+
+Residency changes the drain semantics. In-flight counting is per-resident, not
+global — evicting model A must not wait on requests in flight against model B.
+This was the single largest structural change of Stage 3, and it is done: a
+`Resident` owns its backend, its counter and its own drain gate, so an eviction
+waits on its victim alone. With admission at one the distinction is invisible;
+it exists so that opening admission is a budget change, not a re-reasoning of
+every drain.
+
 ### 6.2 Yield: the tier vramux cannot perform itself
 
 Tiers 1 and 2 are vramux stopping things vramux started. Tier 3 is not: a
@@ -366,19 +376,9 @@ Two consequences worth stating plainly:
   not have any (§5, and "a lease is a promise, not a fence").
 
 The serving side waits `VRAMUX_YIELD_WAIT` (30 s, `0` disables asking
-entirely) and then loads anyway. Waiting indefinitely for an answer that may
-never come turns a cooperative gesture into a hang, and the load was going to
-happen regardless — the only question was whether the holder got told first.
-
-### 6.1 The in-flight problem
-
-Residency changes the drain semantics. In-flight counting is per-resident, not
-global — evicting model A must not wait on requests in flight against model B.
-This was the single largest structural change of Stage 3, and it is done: a
-`Resident` owns its backend, its counter and its own drain gate, so an eviction
-waits on its victim alone. With admission at one the distinction is invisible;
-it exists so that opening admission is a budget change, not a re-reasoning of
-every drain.
+entirely) and then returns a retryable refusal. Waiting indefinitely for an
+answer that may never come turns a cooperative gesture into a hang; loading
+anyway lets an auto-fitting backend silently spill most layers to CPU.
 
 ## 7. Serving language models
 

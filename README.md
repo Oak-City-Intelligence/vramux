@@ -64,7 +64,7 @@ Requires Python 3.10+, `aiohttp`, `PyYAML`, and — for GGUF models — a
 [llama.cpp](https://github.com/ggml-org/llama.cpp) build.
 
 ```bash
-git clone git@github.com:Oak-City-Intelligence/vramux.git
+git clone https://github.com/Oak-City-Intelligence/vramux.git
 cd vramux
 cp models.example.yml models.yml   # then edit it
 python3 -m vramux
@@ -307,10 +307,10 @@ only: the wrapper does not know what your job is in the middle of, and killing
 a stage nine minutes into ten to free memory for a chat request is worse than
 the contention it solves.
 
-**Nothing is taken.** A holder that ignores the request keeps every byte; the
-deadline only decides when vramux logs that it was ignored, and the requester
-carries on exactly as it would have if yield did not exist. Serving waits
-`VRAMUX_YIELD_WAIT` seconds and then loads anyway.
+**Nothing is taken.** A holder that ignores the request keeps every byte.
+Serving waits `VRAMUX_YIELD_WAIT` seconds, then returns a retryable 503 rather
+than letting llama-server silently put most of a model on CPU. The caller can
+retry after the lease releases.
 
 **Priority is higher-wins**, and yield is asked only of holders *strictly
 below* the asker — equal never yields, or every default holder would be asking
