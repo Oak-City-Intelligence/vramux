@@ -944,9 +944,13 @@ class ResidencyArbiter:
             if not self._residents:
                 return
             now = time.monotonic()
+            # A timeout of 0 is "never": the model's own traffic does not pass
+            # through here, so idleness cannot be observed and must not be assumed.
             expired = [
                 r for r in self.residents
-                if r.inflight == 0 and now - r.last_use > self._effective_idle_timeout(r)
+                if r.inflight == 0
+                and self._effective_idle_timeout(r) > 0
+                and now - r.last_use > self._effective_idle_timeout(r)
             ]
             dead = [r for r in self.residents if not r.backend.alive()]
             if not expired and not dead:

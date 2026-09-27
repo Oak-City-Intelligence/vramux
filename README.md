@@ -57,6 +57,17 @@ not defended.
 - `POST /gpu/lease`, `DELETE /gpu/lease/{id}`, `POST /gpu/lease/{id}/renew` —
   memory reserved for consumers vramux does not run
 - `POST /gpu/evict` — unload a named resident by hand
+- an empty `/api/generate` or `/api/chat` (no prompt, no messages) loads the
+  model and answers `done_reason: "load"` — ollama's warm-up, and the load
+  path for a resident that speaks no chat API
+- `/m/{tag}/{path}` — any request, forwarded verbatim to whatever `tag`
+  serves, admitting it first. This is how a non-LLM backend (an image stack)
+  is a resident like any other: `POST /m/imagestack:1/prompt` makes room, brings
+  the container up, and forwards. Websockets are not proxied; a UI uses the
+  backend's own port once it is loaded.
+- a docker entry may set `health_path` (default `/health`) for a server that
+  says ready elsewhere, and `idle_timeout: 0` for one whose traffic bypasses
+  vramux and so can never be seen to be idle
 
 ## Install
 

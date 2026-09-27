@@ -36,6 +36,29 @@ Forbidden, by name:
 - No allocating first and hoping. If the tool cannot be wrapped, it is not
   ready to run on this machine.
 
+### 1a. A stack vramux runs for you needs no lease
+
+Some GPU consumers are registered in vramux's `models.yml` as residents in
+their own right — the image stack is `imagestack:1` here. For those there is
+no lease and no wrapper: talk to vramux and it does the rest.
+
+```bash
+# bring it up (evicts whatever is in the way, waits until it is healthy)
+curl -s http://127.0.0.1:11434/api/generate -d '{"model":"imagestack:1"}'
+# submit a workflow through vramux — same admission, forwarded verbatim
+curl -s http://127.0.0.1:11434/m/imagestack:1/prompt -d @workflow.api.json
+curl -s http://127.0.0.1:11434/m/imagestack:1/history/<prompt_id>
+# hand the card back when you are done with images
+curl -s http://127.0.0.1:11434/gpu/evict -d '{"tag":"imagestack:1"}'
+```
+
+The stack is `exclusive`: loading it takes the whole card, so your own model
+is evicted while it is up, and your next chat request evicts the stack back
+(the container stops; nothing in flight through `/m/` is cut, it drains
+first). Expect the same latency shape as §3, in both directions. Do not
+`docker` anything yourself, and do not lease around a resident — that is two
+brokers for one card.
+
 ## 2. The priority convention
 
 | priority | who | meaning |

@@ -102,3 +102,20 @@ models:
     weights_dir: ~/models/some-model   # size reporting only
     quantization: W2
     family: some-model
+
+  # A resident that is not a language model: an image workflow server. It has no chat API and says
+  # ready on /system_stats; it is loaded with an empty /api/generate (or any
+  # request on /m/imagestack:1/...) and then spoken to on its own port or through
+  # the /m/ proxy. `exclusive` because an image workflow can fill the card;
+  # `idle_timeout: 0` because its UI traffic bypasses vramux, so idleness is
+  # unobservable — evict it by hand or let a competing load take it down.
+  # No vram_mb: the container starts near-empty and grows per workflow.
+  #imagestack:1:
+  #  kind: docker
+  #  compose_file: /path/to/image-stack/docker-compose.yml
+  #  compose_service: imagestack
+  #  port: 8188
+  #  health_path: /system_stats
+  #  exclusive: true
+  #  idle_timeout: 0
+  #  family: imagestack

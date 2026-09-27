@@ -60,6 +60,17 @@ def _strip_thinking(text: str) -> str:
     return _THINK_BLOCK.sub("", text).lstrip()
 
 
+def _is_load_request(body: Dict[str, Any]) -> bool:
+    """ollama convention: an empty prompt/messages without `keep_alive: 0`
+    means 'load the model and answer done'. It is how a client warms a model
+    it is about to use — and, for a backend that is not a language model at
+    all (an image stack on its own port), the only sensible request there is:
+    bring it up, make room, and let the caller talk to it directly."""
+    if _is_unload_request(body):
+        return False
+    return not body.get("prompt") and not body.get("messages")
+
+
 def _is_unload_request(body: Dict[str, Any]) -> bool:
     """ollama convention: `keep_alive: 0` with empty prompt/messages means
     'unload the model now'. A batch pipeline uses this between stages to hand

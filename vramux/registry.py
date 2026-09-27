@@ -106,6 +106,10 @@ class ModelSpec:
     compose_file: Optional[Path] = None
     compose_service: Optional[str] = None
     port: Optional[int] = None          # host port the container publishes
+    # What the container answers 200 on once it is ready. llama-server-style
+    # servers say /health; an image stack (a workflow server) has no such path and
+    # says /system_stats instead. Readiness and the recycle probe both use it.
+    health_path: str = "/health"
     # Model id the upstream server actually answers to. llama-server is told
     # `--alias <tag>` so tag works there; a docker backend has its own served
     # name baked in at container start, so requests must use that.
@@ -128,7 +132,10 @@ class ModelSpec:
     priority: Optional[int] = None
     # Per-model idle timeout. A container that takes minutes to become ready
     # should not be evicted on the same schedule as a GGUF that loads in
-    # seconds. None = use the arbiter default.
+    # seconds. None = use the arbiter default; 0 = never unload on idle, for a
+    # backend whose traffic does not pass through vramux (a UI on its own port)
+    # and so cannot be seen to be busy — only an explicit evict or another
+    # model needing the room takes it down.
     idle_timeout: Optional[float] = None
     # Directory of weights, for size reporting only (docker kind has no single
     # blob to stat).
@@ -304,6 +311,7 @@ class ModelRegistry:
                         compose_file=Path(entry["compose_file"]).expanduser(),
                         compose_service=entry.get("compose_service"),
                         port=int(entry["port"]),
+                        health_path=str(entry.get("health_path", "/health")),
                         served_name_override=entry.get("served_name"),
                         ctx_size=int(entry.get("ctx", DEFAULT_CTX_SIZE)),
                         idle_timeout=(float(entry["idle_timeout"]) if entry.get("idle_timeout") is not None else None),

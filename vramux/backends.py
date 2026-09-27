@@ -93,12 +93,12 @@ class Backend(Protocol):
         ...
 
 
-async def http_healthy(upstream: str, timeout: float = 5.0) -> bool:
-    """One GET against `upstream/health`. Any error is a no, never an exception."""
+async def http_healthy(upstream: str, timeout: float = 5.0, path: str = "/health") -> bool:
+    """One GET against `upstream{path}`. Any error is a no, never an exception."""
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
-                f"{upstream}/health", timeout=aiohttp.ClientTimeout(total=timeout)
+                f"{upstream}{path}", timeout=aiohttp.ClientTimeout(total=timeout)
             ) as resp:
                 return resp.status == 200
     except (aiohttp.ClientError, asyncio.TimeoutError):
@@ -306,7 +306,7 @@ class DockerComposeBackend:
         return self._running
 
     async def healthy(self) -> bool:
-        return await http_healthy(self.upstream)
+        return await http_healthy(self.upstream, path=self.spec.health_path)
 
     def adopt(self) -> None:
         """Claim a container this process did not start.
@@ -375,7 +375,7 @@ class DockerComposeBackend:
             while time.monotonic() < deadline:
                 try:
                     async with session.get(
-                        f"{self.upstream}/health", timeout=aiohttp.ClientTimeout(total=2)
+                        f"{self.upstream}{spec.health_path}", timeout=aiohttp.ClientTimeout(total=2)
                     ) as resp:
                         if resp.status == 200:
                             log.info("container ready for %s", spec.tag)

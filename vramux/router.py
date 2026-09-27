@@ -38,6 +38,7 @@ from .registry import ModelRegistry
 from .residency import BackendLoading, ResidencyArbiter
 from .translate import (
     _JSON_GRAMMAR,
+    _is_load_request,
     _is_unload_request,
     _ollama_options_to_openai,
     _openai_chat_to_ollama,
@@ -534,6 +535,8 @@ class Router:
             return web.json_response({"error": f"model '{model}' not found"}, status=404)
         if _is_unload_request(body):
             return await self._handle_unload(model, spec)
+        if _is_load_request(body):
+            return await self._handle_load(model, spec)
         try:
             await self.arbiter.acquire(spec)
         except BackendLoading as exc:
@@ -570,6 +573,8 @@ class Router:
             return web.json_response({"error": f"model '{model}' not found"}, status=404)
         if _is_unload_request(body):
             return await self._handle_unload(model, spec)
+        if _is_load_request(body):
+            return await self._handle_load(model, spec)
         try:
             await self.arbiter.acquire(spec)
         except BackendLoading as exc:
@@ -617,6 +622,27 @@ class Router:
         finally:
             self.arbiter.release(spec.tag)
 
+    async def _handle_load(self, model: str, spec) -> web.Response:
+        """Load one model and answer — ollama's empty-prompt warm-up.
+
+        Admission runs in full: room is made, the backend comes up, health is
+        waited on. Nothing is sent upstream, so this is also the load path for
+        a backend that speaks no chat API at all: what it does answer to is
+        reached on its own port afterwards, or through `/m/{tag}/...`.
+        """
+        try:
+            await self.arbiter.acquire(spec)
+        except BackendLoading as exc:
+            return _still_loading(exc)
+        self.arbiter.release(spec.tag)
+        return web.json_response({
+            "model": model,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "response": "",
+            "done": True,
+            "done_reason": "load",
+        })
+
     async def _handle_unload(self, model: str, spec=None) -> web.Response:
         """Unload one model — ollama's `keep_alive: 0`. Returns ollama's shape.
 
@@ -657,6 +683,68 @@ class Router:
             assert self._client_session is not None
             async with self._client_session.post(upstream_url, json=body) as upstream:
                 resp = web.StreamResponse(status=upstream.status, headers={"Content-Type": upstream.headers.get("Content-Type", "application/json")})
+                await resp.prepare(request)
+                async for chunk in upstream.content.iter_any():
+                    await resp.write(chunk)
+                await resp.write_eof()
+                return resp
+        finally:
+            self.arbiter.release(spec.tag)
+
+    # ---- generic per-model proxy ----------------------------------------------
+
+    # Hop-by-hop headers, and the ones the proxy sets itself.
+    _PROXY_DROP = frozenset({
+        "host", "connection", "keep-alive", "transfer-encoding", "upgrade",
+        "proxy-authorization", "proxy-authenticate", "te", "trailer",
+        "content-length",
+    })
+
+    async def model_proxy(self, request: web.Request) -> web.StreamResponse:
+        """`/m/{tag}/{path}` — any request, to whatever `tag` serves.
+
+        For a backend whose API is not a chat API (an image stack, say), this
+        is the route that makes it a vramux resident like any other: the
+        request admits the model, room is made for it, and the request is then
+        forwarded verbatim — method, query, headers, body — and the response
+        streamed back. In flight, the resident cannot be evicted underneath
+        the caller, same as a chat completion.
+
+        Websockets are not proxied; a UI that needs one talks to the backend's
+        own port after loading it here or via an empty `/api/generate`.
+        """
+        tag = request.match_info["tag"]
+        spec = self.registry.get(tag)
+        if not spec:
+            return web.json_response({"error": f"model '{tag}' not found"}, status=404)
+        if request.headers.get("Upgrade", "").lower() == "websocket":
+            return web.json_response(
+                {"error": "websockets are not proxied; use the backend's own port"},
+                status=501,
+            )
+        try:
+            await self.arbiter.acquire(spec)
+        except BackendLoading as exc:
+            return _still_loading(exc)
+        try:
+            path = request.match_info.get("path", "")
+            upstream_url = f"{self.arbiter.upstream_for(spec.tag)}/{path}"
+            if request.query_string:
+                upstream_url += f"?{request.query_string}"
+            headers = {
+                k: v for k, v in request.headers.items()
+                if k.lower() not in self._PROXY_DROP
+            }
+            body = await request.read()
+            assert self._client_session is not None
+            async with self._client_session.request(
+                request.method, upstream_url, headers=headers, data=body or None,
+            ) as upstream:
+                out_headers = {
+                    k: v for k, v in upstream.headers.items()
+                    if k.lower() not in self._PROXY_DROP
+                }
+                resp = web.StreamResponse(status=upstream.status, headers=out_headers)
                 await resp.prepare(request)
                 async for chunk in upstream.content.iter_any():
                     await resp.write(chunk)
@@ -821,4 +909,5 @@ def make_app(
     app.router.add_post("/v1/chat/completions", r.openai_passthrough)
     app.router.add_post("/v1/completions", r.openai_passthrough)
     app.router.add_post("/v1/embeddings", r.openai_passthrough)
+    app.router.add_route("*", "/m/{tag}/{path:.*}", r.model_proxy)
     return app
