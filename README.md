@@ -68,6 +68,14 @@ not defended.
 - a docker entry may set `health_path` (default `/health`) for a server that
   says ready elsewhere, and `idle_timeout: 0` for one whose traffic bypasses
   vramux and so can never be seen to be idle
+- `busy_path` names such a backend's job queue (a GET answering JSON whose
+  top-level lists are queues). A competing load waits until every list is
+  empty, and refuses after `--busy-wait` rather than stop it mid-job; a lease
+  never evicts it while busy
+- `restore_after: N` lends the card instead of giving it up: when a competing
+  load displaces the resident, the borrower is unloaded after N idle seconds
+  (or when evicted) and the resident is started back up. An explicit evict of
+  the resident itself cancels that
 
 ## Install
 

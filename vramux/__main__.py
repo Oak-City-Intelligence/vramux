@@ -28,6 +28,7 @@ from .registry import ModelRegistry
 from .router import make_app
 from .residency import (
     DEFAULT_MAX_RESIDENTS,
+    DEFAULT_BUSY_WAIT,
     DEFAULT_QUEUE_WAIT,
     DEFAULT_SERVING_PRIORITY,
     DEFAULT_YIELD_WAIT,
@@ -50,6 +51,7 @@ def _serve(args: argparse.Namespace) -> None:
         yield_wait=args.yield_wait,
         serving_priority=args.serving_priority,
         queue_wait=args.queue_wait,
+        busy_wait=args.busy_wait,
     )
     # `loading` rather than the arbiter itself: the broker needs to know a load
     # is in flight — it has not allocated yet, so the card reads freer than it
@@ -182,6 +184,10 @@ def main() -> None:
                         default=env.get_float("QUEUE_WAIT", DEFAULT_QUEUE_WAIT),
                         help="seconds an outranked load request parks behind a "
                              "higher-priority lease before refusing; 0 fails fast")
+    parser.add_argument("--busy-wait", type=float,
+                        default=env.get_float("BUSY_WAIT", DEFAULT_BUSY_WAIT),
+                        help="seconds a load waits for a displaced backend's own job "
+                             "queue (busy_path) to empty before refusing")
     parser.add_argument("--sample-interval", type=float,
                         default=env.get_float("SAMPLE_INTERVAL", SAMPLE_INTERVAL),
                         help="seconds between usage-history samples")

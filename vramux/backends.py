@@ -83,6 +83,16 @@ class Backend(Protocol):
         """
         ...
 
+    async def busy(self) -> Optional[int]:
+        """How many jobs this backend is working on that vramux never saw.
+
+        Zero for a kind whose every request passes through the router — those
+        are counted as in flight already. None means "could not tell", and the
+        arbiter treats it as not busy: a backend that cannot answer its own
+        queue is not going to finish a job either.
+        """
+        ...
+
     def adopt(self) -> None:
         """Declare that an instance started by a *previous* process is running,
         so that `stop()` will tear it down.
@@ -103,6 +113,28 @@ async def http_healthy(upstream: str, timeout: float = 5.0, path: str = "/health
                 return resp.status == 200
     except (aiohttp.ClientError, asyncio.TimeoutError):
         return False
+
+
+async def http_queue_depth(upstream: str, path: str, timeout: float = 5.0) -> Optional[int]:
+    """Jobs queued at `upstream{path}`: the summed length of its top-level lists.
+
+    A workflow server's /queue answers {"queue_running": [...],
+    "queue_pending": [...]}; anything of that shape reads the same way. None
+    on any error or on a body that is not a JSON object.
+    """
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{upstream}{path}", timeout=aiohttp.ClientTimeout(total=timeout)
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                body = await resp.json(content_type=None)
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+        return None
+    if not isinstance(body, dict):
+        return None
+    return sum(len(v) for v in body.values() if isinstance(v, list))
 
 
 def resolve_llama_server_bin() -> Optional[Path]:
@@ -164,6 +196,9 @@ class ProcessBackend:
 
     async def healthy(self) -> bool:
         return await http_healthy(self.upstream)
+
+    async def busy(self) -> Optional[int]:
+        return 0
 
     async def pids(self) -> List[int]:
         """The process holding VRAM is the one we spawned."""
@@ -307,6 +342,11 @@ class DockerComposeBackend:
 
     async def healthy(self) -> bool:
         return await http_healthy(self.upstream, path=self.spec.health_path)
+
+    async def busy(self) -> Optional[int]:
+        if not self.spec.busy_path:
+            return 0
+        return await http_queue_depth(self.upstream, self.spec.busy_path)
 
     def adopt(self) -> None:
         """Claim a container this process did not start.

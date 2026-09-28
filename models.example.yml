@@ -109,6 +109,10 @@ models:
   # the /m/ proxy. `exclusive` because an image workflow can fill the card;
   # `idle_timeout: 0` because its UI traffic bypasses vramux, so idleness is
   # unobservable — evict it by hand or let a competing load take it down.
+  # `busy_path` is its job queue, so a competing load waits for the running
+  # workflow instead of stopping the container under it; `restore_after` lends
+  # the card rather than giving it up — the borrower is unloaded after that many
+  # idle seconds and the image stack is started back up.
   # No vram_mb: the container starts near-empty and grows per workflow.
   #imagestack:1:
   #  kind: docker
@@ -116,6 +120,8 @@ models:
   #  compose_service: imagestack
   #  port: 8188
   #  health_path: /system_stats
+  #  busy_path: /queue
+  #  restore_after: 120
   #  exclusive: true
   #  idle_timeout: 0
   #  family: imagestack

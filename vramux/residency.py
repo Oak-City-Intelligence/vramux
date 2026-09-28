@@ -72,6 +72,14 @@ _PARK_POLL = 1.0
 # between the two would fail a request the very moment its memory came back.
 _PARK_GRACE = 10.0
 
+# How long a load waits for a displaced backend to finish the jobs it is
+# running that vramux never saw (its `busy_path` queue) before refusing. Long
+# enough for a video workflow; a refusal here is retryable and kills nothing.
+DEFAULT_BUSY_WAIT = 900.0
+
+# How often a busy backend's queue is re-read while a load waits on it.
+_BUSY_POLL = 2.0
+
 # Ceiling on residents, whatever the budget says. The budget is the real
 # constraint; this is a bound on how many upstream ports and backend processes
 # one card is allowed to sprout, and a place to stand if packing ever turns
@@ -174,6 +182,7 @@ class ResidencyArbiter:
         serving_priority: int = DEFAULT_SERVING_PRIORITY,
         outrankers=None,
         queue_wait: float = DEFAULT_QUEUE_WAIT,
+        busy_wait: float = DEFAULT_BUSY_WAIT,
     ) -> None:
         self.host = host
         self.port = port
@@ -200,6 +209,7 @@ class ResidencyArbiter:
         # is what every test written before the queue existed gets.
         self._outrankers = outrankers
         self.queue_wait = max(0.0, float(queue_wait))
+        self.busy_wait = max(0.0, float(busy_wait))
         # Consecutive upstream ports, one per possible llama-server. Containers
         # publish their own and never take one.
         self._free_ports: List[int] = [port + i for i in range(self.max_residents)]
@@ -215,6 +225,10 @@ class ResidencyArbiter:
         self.admission_timeout = admission_timeout
 
         self._residents: Dict[str, Resident] = {}
+        # Residents a competing load displaced that asked for the card back
+        # (`restore_after`), started again once the card is empty. An explicit
+        # evict or a load of the model itself removes its entry.
+        self._displaced: Dict[str, ModelSpec] = {}
         # Why the last admission attempt did not fit, so the eviction it causes
         # says something more useful than "making room".
         self._room_reason = "the card is full"
@@ -370,6 +384,7 @@ class ResidencyArbiter:
             if resident is None:
                 await self._make_room_for(spec)
                 resident = await self._start_with_retry(spec)
+            self._displaced.pop(spec.tag, None)
             resident.inflight += 1
             resident.drained.clear()
             resident.last_use = time.monotonic()
@@ -678,7 +693,15 @@ class ResidencyArbiter:
         await self._evict(victim, incoming=incoming)
 
     async def _evict(self, resident: Resident, *, incoming: Optional[ModelSpec] = None) -> None:
-        """Drain this resident's own in-flight requests, then stop it."""
+        """Drain this resident's own in-flight requests, then stop it.
+
+        A displacement (`incoming` given) also waits out the jobs the resident
+        is running that never passed through here, and refuses rather than
+        stop it under one. A displaced resident that asked for the card back
+        is remembered so the card can be returned to it.
+        """
+        if incoming is not None:
+            await self._wait_until_not_busy(resident, incoming)
         if resident.inflight > 0:
             log.info(
                 "deferring swap %s -> %s until %d in-flight request(s) drain",
@@ -695,7 +718,92 @@ class ResidencyArbiter:
             log.info("evicting %s", resident.tag)
         else:
             log.info("swapping model: %s -> %s", resident.tag, incoming.tag)
+            if resident.spec.restore_after is not None:
+                self._displaced[resident.tag] = resident.spec
+                log.info(
+                    "%s is lent to %s and comes back once the card is free "
+                    "(borrower held to %.0fs idle)",
+                    resident.tag, incoming.tag, resident.spec.restore_after,
+                )
         await self._stop_resident(resident)
+
+    async def _busy_jobs(self, resident: Resident) -> int:
+        """Jobs the resident is running that vramux never saw; 0 if it cannot say."""
+        probe = getattr(resident.backend, "busy", None)
+        if probe is None:
+            return 0
+        try:
+            jobs = await probe()
+        except Exception as exc:
+            log.debug("busy probe for %s failed: %s", resident.tag, exc)
+            return 0
+        return jobs or 0
+
+    async def _wait_until_not_busy(self, resident: Resident, incoming: ModelSpec) -> None:
+        """Hold a displacing load until the resident's own queue is empty.
+
+        The resident's work bypasses the router, so `inflight` says nothing
+        about it and the drain below would stop it mid-job. Its queue does say,
+        so wait on that, reporting the wait the way a park does. Bounded: a
+        queue that never empties gets a retryable refusal, never a kill.
+        """
+        jobs = await self._busy_jobs(resident)
+        if jobs <= 0:
+            return
+        started = time.monotonic()
+        previous = self._loading
+        behind = f"{resident.tag}'s running job(s)"
+        self._loading = Loading(
+            tag=incoming.tag, started=started, budget=self.busy_wait, behind=behind,
+        )
+        log.info(
+            "%s waits for %s to finish %d job(s) before taking the card (up to %.0fs)",
+            incoming.tag, resident.tag, jobs, self.busy_wait,
+        )
+        last_log = started
+        try:
+            while jobs > 0:
+                now = time.monotonic()
+                if now - started >= self.busy_wait:
+                    raise InsufficientVRAM(
+                        f"{incoming.tag} needs the card, and {resident.tag} still has "
+                        f"{jobs} job(s) after {now - started:.0f}s — not stopping it "
+                        f"under them; try again when they finish"
+                    )
+                if now - last_log >= _WAIT_LOG_INTERVAL:
+                    last_log = now
+                    log.info("waiting: %s behind %d job(s) on %s", incoming.tag, jobs, resident.tag)
+                await asyncio.sleep(_BUSY_POLL)
+                jobs = await self._busy_jobs(resident)
+            log.info(
+                "%s finished its jobs after %.0fs; %s takes the card",
+                resident.tag, time.monotonic() - started, incoming.tag,
+            )
+        finally:
+            self._loading = previous
+
+    async def _restore_displaced(self) -> None:
+        """Start back up what a borrow displaced, once nothing else is resident.
+
+        Called with the lock held, from the places the card empties: an idle
+        unload, a reaped corpse, an explicit evict of the borrower. A restore
+        that fails is logged and dropped — it is a courtesy to a UI, and a
+        failure here must not wedge the arbiter or retry forever.
+        """
+        if self._residents:
+            return
+        while self._displaced:
+            tag, spec = next(iter(self._displaced.items()))
+            del self._displaced[tag]
+            log.info("giving the card back to %s", tag)
+            try:
+                await self._make_room_for(spec)
+                resident = await self._start_with_retry(spec)
+            except Exception as exc:
+                log.warning("could not give the card back to %s: %s", tag, exc)
+                continue
+            resident.last_use = time.monotonic()
+            return
 
     async def evict(self, tag: str) -> bool:
         """Drop one resident by name. False when it was not resident.
@@ -704,10 +812,13 @@ class ResidencyArbiter:
         so a hand-evicted model does not kill a stream in progress either.
         """
         async with self._lock:
+            # The operator's word outranks a promise to give it back.
+            self._displaced.pop(tag, None)
             resident = self._residents.get(tag)
             if resident is None:
                 return False
             await self._evict(resident)
+            await self._restore_displaced()
             return True
 
     def _effective_priority(self, resident: Resident) -> int:
@@ -746,6 +857,7 @@ class ResidencyArbiter:
                 eligible = [
                     r for r in self._residents.values()
                     if self._effective_priority(r) < priority
+                    and await self._busy_jobs(r) <= 0
                 ]
                 if not eligible:
                     break
@@ -929,8 +1041,20 @@ class ResidencyArbiter:
         if resident is None:
             resident = self._hot_resident()
         if resident is not None and resident.spec.idle_timeout is not None:
-            return resident.spec.idle_timeout
-        return self.idle_timeout
+            timeout = resident.spec.idle_timeout
+        else:
+            timeout = self.idle_timeout
+        # A borrower holds the card only as long as the one it displaced
+        # agreed to wait, whatever its own timeout says — 0 ("never") included.
+        waits = [
+            s.restore_after for t, s in self._displaced.items()
+            if resident is None or t != resident.tag
+        ]
+        if waits:
+            # Floored above 0, which the watcher reads as "never".
+            cap = max(1.0, min(waits))
+            timeout = cap if timeout <= 0 else min(timeout, cap)
+        return timeout
 
     def _ensure_idle_watcher(self) -> None:
         if self._idle_task and not self._idle_task.done():
@@ -972,5 +1096,6 @@ class ResidencyArbiter:
                     if self._residents.get(resident.tag) is resident:
                         log.warning("backend for %s is gone — reaping", resident.tag)
                         await self._stop_resident(resident)
+                await self._restore_displaced()
             if not self._residents:
                 return

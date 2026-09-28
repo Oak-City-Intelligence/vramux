@@ -137,6 +137,19 @@ class ModelSpec:
     # and so cannot be seen to be busy — only an explicit evict or another
     # model needing the room takes it down.
     idle_timeout: Optional[float] = None
+    # Where a backend whose work bypasses vramux says whether it is working. A
+    # GET answering JSON; every top-level list in it is a queue, and the
+    # backend is busy while any of them is non-empty (a workflow server's
+    # /queue: running and pending). Only then can "in flight" be seen for
+    # traffic that never passed through here, so a competing load waits for
+    # the job instead of stopping the backend under it.
+    busy_path: Optional[str] = None
+    # Give the card back. When a competing load displaces this model, it is
+    # remembered, the borrower is held to this many idle seconds, and once the
+    # card is empty again this model is started back up — so a UI on its own
+    # port is interrupted for a borrow, not down until somebody notices.
+    # None = displaced means gone, as before. An explicit evict forgets it.
+    restore_after: Optional[float] = None
     # Directory of weights, for size reporting only (docker kind has no single
     # blob to stat).
     weights_dir: Optional[Path] = None
@@ -315,6 +328,8 @@ class ModelRegistry:
                         served_name_override=entry.get("served_name"),
                         ctx_size=int(entry.get("ctx", DEFAULT_CTX_SIZE)),
                         idle_timeout=(float(entry["idle_timeout"]) if entry.get("idle_timeout") is not None else None),
+                        busy_path=(str(entry["busy_path"]) if entry.get("busy_path") else None),
+                        restore_after=(float(entry["restore_after"]) if entry.get("restore_after") is not None else None),
                         weights_dir=(Path(entry["weights_dir"]).expanduser() if entry.get("weights_dir") else None),
                         quantization=entry.get("quantization", "unknown"),
                         family=entry.get("family"),
