@@ -112,7 +112,9 @@ models:
   # `busy_path` is its job queue, so a competing load waits for the running
   # workflow instead of stopping the container under it; `restore_after` lends
   # the card rather than giving it up — the borrower is unloaded after that many
-  # idle seconds and the image stack is started back up.
+  # idle seconds and the image stack is started back up. `lend_after` keeps it
+  # until its queue has sat empty that long, so whoever loaded it can queue a
+  # job before a waiting request takes the card back.
   # No vram_mb: the container starts near-empty and grows per workflow.
   #imagestack:1:
   #  kind: docker
@@ -122,6 +124,7 @@ models:
   #  health_path: /system_stats
   #  busy_path: /queue
   #  restore_after: 120
+  #  lend_after: 90
   #  exclusive: true
   #  idle_timeout: 0
   #  family: imagestack

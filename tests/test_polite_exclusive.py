@@ -147,3 +147,33 @@ async def test_a_lease_cannot_evict_a_busy_resident():
     sup.jobs["stack:1"] = 1
     assert await sup.make_room_for_lease(20000, by="batch", priority=9) == 0
     assert sup.current_tag == "stack:1"
+
+
+async def test_a_parked_request_cannot_take_the_card_the_instant_the_stack_comes_up():
+    sup = QueueArbiter(drain_timeout=0.2, startup_timeout=5.0, busy_wait=5.0)
+    img, llm = stack(lend_after=0.3), spec("llm:27b")
+    await sup.acquire(img)
+    sup.release("stack:1")
+
+    load = asyncio.create_task(sup.acquire(llm))
+    await asyncio.sleep(0.1)
+    assert not load.done(), "a freshly loaded stack is not lent before its client can queue"
+    sup.jobs["stack:1"] = 1          # the client queues its job inside the window
+    await asyncio.sleep(0.5)
+    assert not load.done(), "and then the job holds it"
+    assert "stop:stack:1" not in sup.events
+
+    sup.jobs["stack:1"] = 0
+    await asyncio.sleep(0.1)
+    assert not load.done(), "the window restarts when the queue empties"
+    await asyncio.wait_for(load, 2)
+    assert sup.events == ["start:stack:1", "stop:stack:1", "start:llm:27b"]
+
+
+async def test_without_lend_after_an_idle_stack_is_lent_at_once():
+    sup = QueueArbiter(drain_timeout=0.2, startup_timeout=5.0, busy_wait=5.0)
+    img, llm = stack(), spec("llm:27b")
+    await sup.acquire(img)
+    sup.release("stack:1")
+    await asyncio.wait_for(sup.acquire(llm), 0.5)
+    assert sup.current_tag == "llm:27b"

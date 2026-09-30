@@ -76,6 +76,10 @@ not defended.
   load displaces the resident, the borrower is unloaded after N idle seconds
   (or when evicted) and the resident is started back up. An explicit evict of
   the resident itself cancels that
+- `lend_after: N` holds the resident until its queue has been empty for N
+  seconds, counting from when it came up. A client that loads it and then
+  uploads and queues is not beaten to the card by a request already parked
+  behind the load
 
 ## Install
 

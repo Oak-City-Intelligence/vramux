@@ -131,6 +131,9 @@ class Resident:
     # The upstream port this resident borrowed, returned to the pool when it
     # stops. None for a container, which publishes its own.
     port: Optional[int] = None
+    # Monotonic time its busy_path queue was last seen non-empty, or it came
+    # up, whichever is later. `lend_after` counts from here.
+    last_busy: float = 0.0
 
     def __post_init__(self) -> None:
         self.drained.set()
@@ -702,6 +705,7 @@ class ResidencyArbiter:
         """
         if incoming is not None:
             await self._wait_until_not_busy(resident, incoming)
+        drained = resident.inflight > 0
         if resident.inflight > 0:
             log.info(
                 "deferring swap %s -> %s until %d in-flight request(s) drain",
@@ -714,6 +718,9 @@ class ResidencyArbiter:
                     "drain timed out after %.0fs with %d in-flight; forcing swap",
                     self.drain_timeout, resident.inflight,
                 )
+        if drained and incoming is not None:
+            # The drain can take minutes; a job may have been queued meanwhile.
+            await self._wait_until_not_busy(resident, incoming)
         if incoming is None:
             log.info("evicting %s", resident.tag)
         else:
@@ -737,18 +744,31 @@ class ResidencyArbiter:
         except Exception as exc:
             log.debug("busy probe for %s failed: %s", resident.tag, exc)
             return 0
-        return jobs or 0
+        jobs = jobs or 0
+        if jobs > 0:
+            resident.last_busy = time.monotonic()
+        return jobs
+
+    def _settling(self, resident: Resident) -> float:
+        """Seconds left before an idle resident may be lent; 0 if it may be now."""
+        window = resident.spec.lend_after
+        if not window:
+            return 0.0
+        return max(0.0, resident.last_busy + window - time.monotonic())
 
     async def _wait_until_not_busy(self, resident: Resident, incoming: ModelSpec) -> None:
         """Hold a displacing load until the resident's own queue is empty.
 
         The resident's work bypasses the router, so `inflight` says nothing
         about it and the drain below would stop it mid-job. Its queue does say,
-        so wait on that, reporting the wait the way a park does. Bounded: a
-        queue that never empties gets a retryable refusal, never a kill.
+        so wait on that, reporting the wait the way a park does. A resident
+        with `lend_after` is also held until its queue has been empty that
+        long, so the client that loaded it has time to queue its job. Bounded:
+        a queue that never empties gets a retryable refusal, never a kill.
         """
         jobs = await self._busy_jobs(resident)
-        if jobs <= 0:
+        settling = self._settling(resident)
+        if jobs <= 0 and settling <= 0:
             return
         started = time.monotonic()
         previous = self._loading
@@ -756,13 +776,19 @@ class ResidencyArbiter:
         self._loading = Loading(
             tag=incoming.tag, started=started, budget=self.busy_wait, behind=behind,
         )
-        log.info(
-            "%s waits for %s to finish %d job(s) before taking the card (up to %.0fs)",
-            incoming.tag, resident.tag, jobs, self.busy_wait,
-        )
+        if jobs > 0:
+            log.info(
+                "%s waits for %s to finish %d job(s) before taking the card (up to %.0fs)",
+                incoming.tag, resident.tag, jobs, self.busy_wait,
+            )
+        else:
+            log.info(
+                "%s waits %.0fs: %s came up or went idle too recently to be lent",
+                incoming.tag, settling, resident.tag,
+            )
         last_log = started
         try:
-            while jobs > 0:
+            while jobs > 0 or settling > 0:
                 now = time.monotonic()
                 if now - started >= self.busy_wait:
                     raise InsufficientVRAM(
@@ -775,8 +801,9 @@ class ResidencyArbiter:
                     log.info("waiting: %s behind %d job(s) on %s", incoming.tag, jobs, resident.tag)
                 await asyncio.sleep(_BUSY_POLL)
                 jobs = await self._busy_jobs(resident)
+                settling = self._settling(resident)
             log.info(
-                "%s finished its jobs after %.0fs; %s takes the card",
+                "%s has been idle long enough after %.0fs; %s takes the card",
                 resident.tag, time.monotonic() - started, incoming.tag,
             )
         finally:
@@ -985,6 +1012,7 @@ class ResidencyArbiter:
             raise
         finally:
             self._loading = None
+        resident.last_busy = time.monotonic()
         self._ensure_idle_watcher()
         return resident
 

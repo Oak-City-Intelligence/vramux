@@ -150,6 +150,14 @@ class ModelSpec:
     # port is interrupted for a borrow, not down until somebody notices.
     # None = displaced means gone, as before. An explicit evict forgets it.
     restore_after: Optional[float] = None
+    # Seconds its busy_path queue must have been empty — counting from the
+    # moment it came up — before a competing load may displace it. A client
+    # that asked for this model loads it, then uploads and queues; without the
+    # window, a request already parked behind the load takes the card back in
+    # the instant between "healthy" and "queued", and stops the backend under
+    # the job it was about to receive. None = displaceable the moment its
+    # queue reads empty, as before.
+    lend_after: Optional[float] = None
     # Directory of weights, for size reporting only (docker kind has no single
     # blob to stat).
     weights_dir: Optional[Path] = None
@@ -330,6 +338,7 @@ class ModelRegistry:
                         idle_timeout=(float(entry["idle_timeout"]) if entry.get("idle_timeout") is not None else None),
                         busy_path=(str(entry["busy_path"]) if entry.get("busy_path") else None),
                         restore_after=(float(entry["restore_after"]) if entry.get("restore_after") is not None else None),
+                        lend_after=(float(entry["lend_after"]) if entry.get("lend_after") is not None else None),
                         weights_dir=(Path(entry["weights_dir"]).expanduser() if entry.get("weights_dir") else None),
                         quantization=entry.get("quantization", "unknown"),
                         family=entry.get("family"),
