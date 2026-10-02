@@ -81,7 +81,11 @@ def _serve(args: argparse.Namespace) -> None:
     # broker's to answer.
     arbiter.use_outrankers(broker.outrankers)
     app = make_app(registry, arbiter, broker)
-    web.run_app(app, host=args.host, port=args.port, print=None)
+    # aiohttp waits 60s by default for open requests to finish before cleanup,
+    # and a `vramux top` console or a long generation keeps one open for good.
+    # systemd's stop timeout is shorter, so cleanup never ran and the process
+    # was SIGKILLed with its containers still up. Five seconds, then cleanup.
+    web.run_app(app, host=args.host, port=args.port, print=None, shutdown_timeout=5)
 
 
 def _remote_state(host: str, port: int) -> dict:
