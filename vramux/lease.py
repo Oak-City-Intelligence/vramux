@@ -28,12 +28,14 @@ The budget stays true, which is the invariant that matters.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import secrets
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 from . import budget as budget_mod
@@ -88,6 +90,15 @@ PRIORITY_INTERACTIVE = 7
 # in vramux revokes a lease when this passes.
 YIELD_DEADLINE = 30.0
 
+# Where the broker keeps its leases between runs. A restart that forgets them
+# leaves every holder running on memory nobody is accounting for, and the next
+# grant lands on top of it (2026-10-02: a restart handed a 19 GB lease out on
+# its way down, and the new process listed no leases while the holder ran).
+def default_state_file() -> Path:
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return Path(base) / "vramux" / "leases.json"
+
+
 # Ancestry walks stop here. A pid chain on a healthy system is a handful of
 # levels; a longer one means something is wrong and is not worth chasing.
 _MAX_ANCESTRY_DEPTH = 32
@@ -113,6 +124,10 @@ class UnknownLease(LeaseError):
     """No such lease; it was released, expired, or predates a restart — 404."""
 
 
+class Closing(LeaseError):
+    """The broker is shutting down and grants nothing more."""
+
+
 class CardUnreadable(LeaseError):
     """The device cannot be read, so no honest answer exists — 503."""
 
@@ -121,6 +136,16 @@ def _iso(seconds_from_now: float) -> str:
     return (datetime.now(timezone.utc) + timedelta(seconds=seconds_from_now)).isoformat(
         timespec="seconds"
     )
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # alive, and owned by another user
+    return True
 
 
 def ppid_of(pid: int) -> Optional[int]:
@@ -221,6 +246,10 @@ class Lease:
     expires_at: float = 0.0
     granted_iso: str = ""
     expires_iso: str = ""
+    # Wall-clock twins of `granted_at` / `expires_at`. The monotonic clock is
+    # meaningless to the next process; these are what the state file carries.
+    granted_wall: float = 0.0
+    expires_wall: float = 0.0
     # What the holder was already holding *at the moment of the grant*. Kept
     # for reporting: a grant of 18 GB that charged 0 is not a bug, and the log
     # line should be able to say so. It is a snapshot and never moves again —
@@ -314,6 +343,8 @@ class Broker:
         sample_interval: float = SAMPLE_INTERVAL,
         poll_interval: float = POLL_INTERVAL,
         parent_of=ppid_of,
+        state_file: Optional[Path] = None,
+        pid_alive=None,
     ) -> None:
         self.observer = observer
         self.reserve_mb = reserve_mb
@@ -331,6 +362,15 @@ class Broker:
         self._leases: Dict[str, Lease] = {}
         self._lock = asyncio.Lock()
         self._timer: Optional[asyncio.Task] = None
+        # Set by `close()`. From then on nothing is granted: shutdown stops the
+        # residents, the card reads free, and a waiting request would be handed
+        # memory by a process that is about to forget it handed anything out.
+        self._closing = False
+        # None keeps leases in memory only — what a test or an embedding wants.
+        self._state_file = Path(state_file) if state_file is not None else None
+        self._pid_alive = pid_alive or _pid_alive
+        if self._state_file is not None:
+            self._load()
         self._last_sample = 0.0
         # Why the last attempt did not grant, so a wait and a 408 can both say
         # something more useful than "busy".
@@ -494,6 +534,8 @@ class Broker:
         asked_to_evict = False
         asked_to_yield = False
         while True:
+            if self._closing:
+                raise Closing("vramux is restarting — ask again in a few seconds")
             async with self._lock:
                 lease = await self._try_grant(mb, owner, ttl, priority, pids)
                 if lease is not None:
@@ -587,6 +629,7 @@ class Broker:
         charge: int,
     ) -> Lease:
         now = time.monotonic()
+        wall = time.time()
         lease = Lease(
             id="lse_" + secrets.token_hex(6),
             owner=owner,
@@ -599,8 +642,11 @@ class Broker:
             granted_iso=_iso(0),
             expires_iso=_iso(ttl),
             covered_at_grant_mb=min(observed, mb),
+            granted_wall=wall,
+            expires_wall=wall + ttl,
         )
         self._leases[lease.id] = lease
+        self._save()
         if charge < mb:
             log.info(
                 "granted %s to %s (%s), %d MiB — %d MiB of it already on the card",
@@ -692,6 +738,8 @@ class Broker:
     async def release(self, lease_id: str) -> Lease:
         async with self._lock:
             lease = self._leases.pop(lease_id, None)
+            if lease is not None:
+                self._save()
         if lease is None:
             raise UnknownLease(f"no such lease: {lease_id}")
         log.info(
@@ -709,7 +757,9 @@ class Broker:
             if ttl is not None:
                 lease.ttl = self._validated_ttl(ttl)
             lease.expires_at = time.monotonic() + lease.ttl
+            lease.expires_wall = time.time() + lease.ttl
             lease.expires_iso = _iso(lease.ttl)
+            self._save()
             return lease
 
     # ---- expiry ---------------------------------------------------------------
@@ -721,6 +771,8 @@ class Broker:
         self._timer = asyncio.create_task(self._tick())
 
     async def close(self) -> None:
+        self._closing = True
+        self._save()
         if self._timer is None:
             return
         self._timer.cancel()
@@ -775,7 +827,79 @@ class Broker:
                     "did not renew or release",
                     lease.id, lease.owner, lease.mb, lease.age(now),
                 )
+            if expired:
+                self._save()
         return expired
+
+    # ---- persistence ----------------------------------------------------------
+
+    def _save(self) -> None:
+        """Write every lease to the state file. Called under the lock, or where
+        no other coroutine can be mid-change; a failed write is logged and the
+        broker carries on, since losing the file is the old behaviour, not a
+        new failure."""
+        if self._state_file is None:
+            return
+        rows = [
+            {
+                "lease": l.id, "owner": l.owner, "mb": l.mb,
+                "priority": l.priority, "ttl": l.ttl, "pids": list(l.pids),
+                "granted_wall": l.granted_wall, "expires_wall": l.expires_wall,
+                "granted_iso": l.granted_iso,
+                "covered_at_grant_mb": l.covered_at_grant_mb,
+            }
+            for l in self._leases.values()
+        ]
+        try:
+            self._state_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._state_file.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"leases": rows}))
+            os.replace(tmp, self._state_file)
+        except OSError as exc:
+            log.warning("could not write lease state to %s: %s", self._state_file, exc)
+
+    def _load(self) -> None:
+        """Take back the leases the last process held, minus the ones whose time
+        ran out while nobody was listening or whose holder is gone.
+
+        The remaining TTL carries over, not a fresh one: a holder that died
+        during the restart must not be given a full TTL it never asked for.
+        """
+        try:
+            data = json.loads(self._state_file.read_text())
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as exc:
+            log.warning("ignoring unreadable lease state %s: %s", self._state_file, exc)
+            return
+        now, wall = time.monotonic(), time.time()
+        for row in data.get("leases") or []:
+            try:
+                remaining = float(row["expires_wall"]) - wall
+                pids = [int(p) for p in row.get("pids") or []]
+                if remaining <= 0:
+                    continue
+                if pids and not any(self._pid_alive(p) for p in pids):
+                    continue
+                granted_wall = float(row.get("granted_wall") or wall)
+                lease = Lease(
+                    id=str(row["lease"]), owner=str(row["owner"]), mb=int(row["mb"]),
+                    priority=int(row.get("priority", PRIORITY_DEFAULT)),
+                    ttl=float(row["ttl"]), pids=pids,
+                    granted_at=now - max(0.0, wall - granted_wall),
+                    expires_at=now + remaining,
+                    granted_iso=str(row.get("granted_iso") or ""),
+                    expires_iso=_iso(remaining),
+                    covered_at_grant_mb=int(row.get("covered_at_grant_mb", 0)),
+                    granted_wall=granted_wall,
+                    expires_wall=wall + remaining,
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                log.warning("skipping a malformed lease row in %s: %s", self._state_file, exc)
+                continue
+            self._leases[lease.id] = lease
+            log.info("restored %s (%s), %d MiB, %.0fs left",
+                     lease.id, lease.owner, lease.mb, remaining)
 
     # ---- validation -----------------------------------------------------------
 

@@ -28,6 +28,7 @@ from .lease import (
     DEFAULT_TTL,
     Broker,
     CardUnreadable,
+    Closing,
     InvalidRequest,
     LeaseError,
     NoRoom,
@@ -863,6 +864,7 @@ _LEASE_STATUS = {
     NoRoom: 408,
     NotGrantable: 413,
     CardUnreadable: 503,
+    Closing: 503,
 }
 
 

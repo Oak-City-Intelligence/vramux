@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import logging
 import sys
+from pathlib import Path
 
 from aiohttp import web
 
@@ -22,6 +23,7 @@ from .lease import (
     SAMPLE_INTERVAL,
     Broker,
     clamped_sample_interval,
+    default_state_file,
 )
 from .observer import CostCache, Observer
 from .registry import ModelRegistry
@@ -61,6 +63,7 @@ def _serve(args: argparse.Namespace) -> None:
         reserve_mb=args.reserve_mb,
         loading=lambda: arbiter.loading,
         sample_interval=clamped_sample_interval(args.sample_interval),
+        state_file=Path(env.get("STATE_FILE") or default_state_file()),
     )
     # The other half of the pair: residency decides room from the same budget
     # the broker grants leases from. Injected after construction because each

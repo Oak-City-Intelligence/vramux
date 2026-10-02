@@ -67,6 +67,10 @@ def _fail(payload: dict, prefix: str = "") -> int:
     return 1
 
 
+# How soon to ask again when the router did not answer, which during a restart
+# is a matter of seconds.
+_RESTART_RETRY = 3.0
+
 _YIELD_SIGNALS = {
     "term": signal.SIGTERM,
     "int": signal.SIGINT,
@@ -102,7 +106,9 @@ class _Renewer:
         self._stop.set()
 
     def _run(self) -> None:
-        while not self._stop.wait(self.interval):
+        wait = self.interval
+        while not self._stop.wait(wait):
+            wait = self.interval
             status, payload = _request(self.url, method="POST", body={})
             if status == 200:
                 self._check_yield(payload)
@@ -114,8 +120,14 @@ class _Renewer:
                 f"{payload.get('error', 'no answer')}",
                 file=sys.stderr,
             )
-            if status in (404, 0):
+            if status == 404:
                 return
+            # No answer, or a router on its way down: a restart, and the next
+            # process restores the lease from its state file. Keep asking, and
+            # sooner than the usual beat, so the gap is seconds and not a third
+            # of the TTL.
+            if status in (0, 503):
+                wait = min(self.interval, _RESTART_RETRY)
 
     def _check_yield(self, payload: dict) -> None:
         """Say it once, and act only if the caller asked to act.
@@ -149,22 +161,33 @@ def lease(args) -> int:
     if not args.command:
         print("vramux lease: nothing to run — put the command after `--`", file=sys.stderr)
         return 2
-    status, payload = _request(
-        _url(args, "/gpu/lease"),
-        method="POST",
-        body={
-            "mb": args.mb,
-            "owner": args.owner,
-            "ttl": args.ttl,
-            "priority": args.priority,
-            "wait": args.wait,
-            # Our own pid, because the command runs inside our process tree and
-            # the broker attributes by ancestry. That is what keeps the grant
-            # from being charged a second time once the child allocates.
-            "pid": os.getpid(),
-        },
-        timeout=args.wait + 30,
-    )
+    # A router restarting under a waiting request answers 503 or drops the
+    # connection; neither is a refusal, so the wait goes on against the same
+    # deadline rather than failing the command.
+    deadline = time.monotonic() + args.wait
+    while True:
+        left = max(0.0, deadline - time.monotonic())
+        status, payload = _request(
+            _url(args, "/gpu/lease"),
+            method="POST",
+            body={
+                "mb": args.mb,
+                "owner": args.owner,
+                "ttl": args.ttl,
+                "priority": args.priority,
+                "wait": left,
+                # Our own pid, because the command runs inside our process tree
+                # and the broker attributes by ancestry. That is what keeps the
+                # grant from being charged a second time once the child allocates.
+                "pid": os.getpid(),
+            },
+            timeout=left + 30,
+        )
+        if status not in (0, 503) or time.monotonic() + _RESTART_RETRY >= deadline:
+            break
+        print(f"vramux: {payload.get('error', 'no answer')} — still waiting",
+              file=sys.stderr)
+        time.sleep(_RESTART_RETRY)
     if status != 200:
         return _fail(payload, "vramux lease: ")
 
