@@ -14,6 +14,7 @@ from the environment or from locations checked for existence first.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -23,6 +24,8 @@ from typing import Dict, List, Optional
 import yaml
 
 from . import env
+
+log = logging.getLogger("vramux.registry")
 
 
 DEFAULT_CTX_SIZE = 8192
@@ -98,6 +101,11 @@ class ModelSpec:
     # of free VRAM — that path bypasses auto-fit and OOMs on large models.
     n_gpu_layers: Optional[int] = None
     extra_args: List[str] = field(default_factory=list)
+    # This model's own llama-server, when the global one cannot load it — a new
+    # architecture lands as a branch build before it reaches the main tree.
+    # None = `VRAMUX_LLAMA_SERVER_BIN`, then $PATH. Scoped to one entry so that
+    # trying a new build cannot change what every other model runs on.
+    server_bin: Optional[Path] = None
     is_embedding: bool = False
     family: Optional[str] = None  # display only
 
@@ -349,12 +357,24 @@ class ModelRegistry:
                     continue
                 gguf = Path(entry["gguf"]).expanduser()
                 yaml_gguf_paths.add(str(gguf))
+                server_bin = None
+                if entry.get("server_bin"):
+                    server_bin = Path(entry["server_bin"]).expanduser()
+                    if not (server_bin.is_file() and os.access(server_bin, os.X_OK)):
+                        # Refused here, naming the model, rather than at the
+                        # first request two minutes into somebody's demo.
+                        log.error(
+                            "%s: server_bin %s is not an executable file — entry skipped",
+                            tag, server_bin,
+                        )
+                        continue
                 specs[tag] = ModelSpec(
                     tag=tag,
                     gguf_path=gguf,
                     ctx_size=int(entry.get("ctx", DEFAULT_CTX_SIZE)),
                     n_gpu_layers=(int(entry["n_gpu_layers"]) if entry.get("n_gpu_layers") is not None else None),
                     extra_args=list(entry.get("extra_args", [])),
+                    server_bin=server_bin,
                     is_embedding=bool(entry.get("embedding", False)),
                     family=entry.get("family"),
                     vram_mb=(int(entry["vram_mb"]) if entry.get("vram_mb") is not None else None),

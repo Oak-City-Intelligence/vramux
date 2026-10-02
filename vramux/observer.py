@@ -104,6 +104,10 @@ def cost_key(spec) -> str:
         " ".join(spec.extra_args or []),
         str(spec.gguf_path or spec.compose_service or ""),
     ]
+    # Appended only when set: a different build can genuinely change the
+    # footprint, and every entry without one keeps the key it was measured under.
+    if getattr(spec, "server_bin", None):
+        parts.append(str(spec.server_bin))
     return hashlib.sha256("\x1f".join(parts).encode()).hexdigest()[:16]
 
 

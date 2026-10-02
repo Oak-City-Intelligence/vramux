@@ -215,7 +215,7 @@ class ProcessBackend:
         )
 
     async def start(self, spec: ModelSpec, startup_timeout: float) -> None:
-        binary = resolve_llama_server_bin()
+        binary = spec.server_bin or resolve_llama_server_bin()
         if binary is None:
             raise RuntimeError(
                 "llama-server not found on $PATH — set VRAMUX_LLAMA_SERVER_BIN "
@@ -247,9 +247,11 @@ class ProcessBackend:
         stderr_path = Path(
             f"/tmp/llama-server-{spec.tag.replace('/', '_').replace(':', '_')}.stderr"
         )
+        # Which binary, every time: on a box where entries can name their own
+        # build, "it started" without "on what" is undiagnosable.
         log.info(
-            "starting llama-server for %s (ctx=%d) — stderr at %s",
-            spec.tag, spec.ctx_size, stderr_path,
+            "starting llama-server for %s (ctx=%d) on %s — stderr at %s",
+            spec.tag, spec.ctx_size, binary, stderr_path,
         )
         self._stderr_fh = stderr_path.open("wb")
         self._proc = await asyncio.create_subprocess_exec(

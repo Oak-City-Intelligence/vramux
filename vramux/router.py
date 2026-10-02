@@ -843,6 +843,9 @@ def _resident_detail(arbiter, cache) -> List[dict]:
             # What it is believed to cost — measured or declared. None means
             # nothing knows, which is also why it is being served alone.
             "cost_mb": known_cost_mb(cache, resident.spec),
+            # Only when it is not the default build: the exception is the
+            # operational fact, and the common case stays quiet.
+            "server_bin": str(resident.spec.server_bin) if resident.spec.server_bin else None,
         })
     return rows
 
@@ -912,5 +915,9 @@ def make_app(
     app.router.add_post("/v1/chat/completions", r.openai_passthrough)
     app.router.add_post("/v1/completions", r.openai_passthrough)
     app.router.add_post("/v1/embeddings", r.openai_passthrough)
+    # Decision models: llama-server scores the caller's options in one pass
+    # and answers with probabilities. Same shape as the rest of /v1 — a
+    # `model` field to resolve, a JSON body passed through.
+    app.router.add_post("/v1/systemone", r.openai_passthrough)
     app.router.add_route("*", "/m/{tag}/{path:.*}", r.model_proxy)
     return app
