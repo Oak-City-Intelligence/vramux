@@ -41,6 +41,7 @@ from .translate import (
     _JSON_GRAMMAR,
     _is_load_request,
     _is_unload_request,
+    _ollama_messages_to_openai,
     _ollama_options_to_openai,
     _openai_chat_to_ollama,
     _sse_chat_to_ollama_lines,
@@ -546,7 +547,7 @@ class Router:
             stream = bool(body.get("stream", True))
             upstream_payload = {
                 "model": spec.served_name,
-                "messages": body.get("messages", []),
+                "messages": _ollama_messages_to_openai(body.get("messages", [])),
                 "stream": stream,
                 **_ollama_options_to_openai(body.get("options") or {}),
             }

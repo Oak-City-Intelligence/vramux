@@ -285,3 +285,32 @@ def test_options_mapping_includes_llamacpp_extensions():
 def test_strip_thinking_removes_block_and_leading_space():
     assert _strip_thinking("<think>x</think>\n\n{\"a\":1}") == '{"a":1}'
     assert _strip_thinking('{"a":1}') == '{"a":1}'
+
+
+# ---- images ----------------------------------------------------------------
+
+
+def test_ollama_images_become_openai_content_parts():
+    from vramux.translate import _ollama_messages_to_openai
+
+    png = "iVBORw0KGgoAAAANSUhEUg"
+    out = _ollama_messages_to_openai([
+        {"role": "system", "content": "be brief"},
+        {"role": "user", "content": "what is this?", "images": [png, "/9j/4AAQ"]},
+    ])
+    assert out[0] == {"role": "system", "content": "be brief"}
+    assert out[1] == {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "what is this?"},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{png}"}},
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,/9j/4AAQ"}},
+        ],
+    }
+
+
+def test_a_message_without_images_is_passed_through_untouched():
+    from vramux.translate import _ollama_messages_to_openai
+
+    msg = {"role": "user", "content": "hi", "images": []}
+    assert _ollama_messages_to_openai([msg]) == [msg]

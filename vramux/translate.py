@@ -107,6 +107,44 @@ def _ollama_options_to_openai(opts: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+# The first bytes of each format, base64-encoded. llama-server decodes the image
+# itself and does not trust the label, but a data URL needs one.
+_IMAGE_MAGIC = (
+    ("iVBORw0KGgo", "image/png"),
+    ("/9j/", "image/jpeg"),
+    ("R0lGOD", "image/gif"),
+    ("UklGR", "image/webp"),
+)
+
+
+def _image_url(image: str) -> str:
+    if image.startswith("data:") or image.startswith("http://") or image.startswith("https://"):
+        return image
+    mime = next((m for magic, m in _IMAGE_MAGIC if image.startswith(magic)), "image/jpeg")
+    return f"data:{mime};base64,{image}"
+
+
+def _ollama_messages_to_openai(messages: Any) -> Any:
+    """ollama carries images beside the text, as `images: [<base64>]`; the
+    OpenAI shape llama-server reads puts them in `content` as parts. Passing
+    ollama's shape through unchanged drops the image without an error."""
+    if not isinstance(messages, list):
+        return messages
+    out = []
+    for msg in messages:
+        images = msg.get("images") if isinstance(msg, dict) else None
+        if not images:
+            out.append(msg)
+            continue
+        converted = {k: v for k, v in msg.items() if k != "images"}
+        text = msg.get("content") or ""
+        parts: List[Dict[str, Any]] = [{"type": "text", "text": text}] if text else []
+        parts += [{"type": "image_url", "image_url": {"url": _image_url(img)}} for img in images]
+        converted["content"] = parts
+        out.append(converted)
+    return out
+
+
 def _openai_tool_calls_to_ollama(calls: Any) -> List[Dict[str, Any]]:
     """OpenAI tool_calls -> ollama shape.
 
