@@ -32,6 +32,7 @@ built in Stage 3, when it was invisible.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import time
 from dataclasses import dataclass, field
@@ -264,6 +265,11 @@ class ResidencyArbiter:
         self._render_open = asyncio.Event()
         self._render_open.set()
         self._parked: Dict[int, tuple] = {}
+        # Tokens of requests that have parked behind a render and not yet
+        # come out of admission (or given up). The scheduler reads this to
+        # let everyone parked at a flip-back through before it flips again.
+        self._unadmitted: set = set()
+        self._tokens = itertools.count(1)
         # True only inside a scheduled acquire, which holds the lock: what it
         # displaces is not remembered for a restore.
         self._scheduling = False
@@ -407,6 +413,13 @@ class ResidencyArbiter:
         `gone`, a callable, says whether the caller's client has left; a
         request parked behind a render checks it and raises `ClientGone`.
         """
+        token = next(self._tokens)
+        try:
+            await self._acquire(spec, scheduled, timings, gone, token)
+        finally:
+            self._unadmitted.discard(token)
+
+    async def _acquire(self, spec, scheduled, timings, gone, token) -> None:
         began = time.monotonic()
         if not scheduled:
             self.last_arrival[spec.tag] = began
@@ -414,7 +427,7 @@ class ResidencyArbiter:
         try:
             while True:
                 if not scheduled:
-                    await self._park_for_render(spec, gone)
+                    await self._park_for_render(spec, gone, token)
                 await self._admit()
                 if scheduled or not self._held_against(spec):
                     break
@@ -500,12 +513,21 @@ class ResidencyArbiter:
         """Requests for any model but `tag` that have asked and not been admitted."""
         return sum(n for t, n in self._arriving.items() if t != tag)
 
-    async def _park_for_render(self, spec: ModelSpec, gone=None) -> None:
+    @property
+    def parked_tokens(self) -> set:
+        return set(self._parked)
+
+    @property
+    def unadmitted(self) -> set:
+        return set(self._unadmitted)
+
+    async def _park_for_render(self, spec: ModelSpec, gone=None, token=None) -> None:
         if not self._held_against(spec):
             return
-        key = id(asyncio.current_task())
+        key = token if token is not None else id(asyncio.current_task())
         since = time.monotonic()
         self._parked[key] = (spec.tag, since)
+        self._unadmitted.add(key)
         log.info("%s parks behind render jobs on %s", spec.tag, self._render_hold)
         try:
             while self._held_against(spec):

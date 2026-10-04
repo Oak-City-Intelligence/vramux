@@ -193,6 +193,11 @@ class Scheduler:
         # Every prompt id this process submitted, so a window counting a
         # human's prompts does not count vramux's own.
         self._submitted: set = set()
+        # Requests parked when the last render let go, not yet admitted. No
+        # flip starts while any is left: a chat request waits at most one
+        # drain, never one per render queued behind it.
+        self._owed: set = set()
+        self._owed_logged = False
 
     # ---- lifecycle ------------------------------------------------------------
 
@@ -277,6 +282,14 @@ class Scheduler:
         # retried in a loop because somebody is holding a window open on it.
         if now < self._not_before:
             return None
+        if self._owed:
+            self._owed &= self.arbiter.unadmitted
+            if self._owed:
+                if not self._owed_logged:
+                    self._owed_logged = True
+                    log.info("next render deferred until the %d request(s) parked at "
+                             "the last flip-back are admitted", len(self._owed))
+                return None
         if self.window is not None:
             spec = self.job_spec(self.window["model"])
             if spec is not None:
@@ -350,9 +363,9 @@ class Scheduler:
             if not isinstance(exc, Exception):
                 raise
             wait = self._failed()
-            self._failed_starts += 1
             log.warning("could not flip to render for %s (failure %d in a row): %s "
                         "— retrying in %.0fs", spec.tag, self._failures, exc, wait)
+            self._failed_starts += 1
             if self._failed_starts % _STARTS_PER_JOB == 0:
                 self._fail_head_job(spec, self._failed_starts)
             return
@@ -369,6 +382,7 @@ class Scheduler:
         finally:
             released = time.monotonic()
             parked = len(self.arbiter.parked)
+            self._owed, self._owed_logged = self.arbiter.parked_tokens, False
             self.arbiter.release(spec.tag, scheduled=True)
             self.arbiter.release_render()
             self.mode, self.render_model = LLM, None

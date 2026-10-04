@@ -663,3 +663,37 @@ async def test_a_restored_workflow_with_no_prompt_id_is_looked_for_first(rig, tm
     await until(lambda: job.terminal)
     assert job.state == DONE and wf.prompt_id == "p-early"
     assert fake.prompts == []
+
+
+# ---- what a flip-back owes the language models -----------------------------------
+
+
+async def test_a_request_parked_at_flip_back_is_admitted_before_the_next_flip(rig):
+    fake, build = rig
+    arbiter, _stack, store, sch = build(stack=stack_spec(render_start_deadline=0))
+    order = []
+    real_hold = arbiter.hold_render
+
+    def hold(tag):
+        order.append("hold")
+        real_hold(tag)
+
+    arbiter.hold_render = hold
+    fake.gate = asyncio.Event()
+    store.submit(STACK, [{"a": {}}])
+    sch.start()
+    await until(lambda: fake.prompts)
+
+    async def chat():
+        await arbiter.acquire(spec("llm:27b"))
+        order.append("chat admitted")
+        arbiter.release("llm:27b")
+
+    parked = asyncio.create_task(chat())
+    await until(lambda: arbiter.parked)
+    late = store.submit(STACK, [{"b": {}}])        # deferred to the next flip
+    fake.gate.set()
+    await asyncio.wait_for(parked, 3)
+    await until(lambda: late.terminal)
+    assert order[:3] == ["hold", "chat admitted", "hold"], order
+
