@@ -117,3 +117,44 @@ async def test_writes_leave_the_event_loop_and_bursts_coalesce(tmp_path, monkeyp
     assert not any(writes), "the write ran on the event loop's thread"
     on_disk = json.loads((tmp_path / "jobs.json").read_text())
     assert len(on_disk["jobs"]) == 20 and jobs[-1].id in {r["id"] for r in on_disk["jobs"]}
+
+
+# ---- reading a bad file ---------------------------------------------------------
+
+
+@pytest.mark.parametrize("content", [
+    "not json at all",
+    json.dumps(["a", "list"]),
+    json.dumps({"jobs": {"not": "a list"}}),
+    json.dumps({"jobs": [{"id": "x", "model": "img:1", "created_wall": "yesterday",
+                          "workflows": []}]}),
+    json.dumps({"jobs": [{"id": "x", "model": "img:1", "created_wall": 1.0,
+                          "workflows": [{"index": "0", "prompt": {}, "state": "pending"}]}]}),
+    json.dumps({"jobs": [], "handovers": "none"}),
+])
+def test_a_bad_file_is_set_aside_and_startup_goes_on(tmp_path, caplog, content):
+    path = tmp_path / "jobs.json"
+    path.write_text(content)
+    with caplog.at_level("ERROR", logger="vramux.jobs"):
+        store = JobStore(path)
+    assert store.all() == []
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert len(errors) == 1 and "jobs.json" in errors[0].getMessage()
+    assert not path.exists()
+    [aside] = list(tmp_path.glob("jobs.json.corrupt-*"))
+    assert aside.read_text() == content
+
+
+def test_an_unknown_state_fails_the_workflow_on_load(tmp_path):
+    path = tmp_path / "jobs.json"
+    path.write_text(json.dumps({"jobs": [{
+        "id": "x", "model": "img:1", "created_wall": 1.0,
+        "workflows": [
+            {"index": 0, "prompt": {"a": {}}, "state": "exploded"},
+            {"index": 1, "prompt": {"b": {}}, "state": "pending"},
+        ],
+    }]}))
+    job = JobStore(path).get("x")
+    assert job.workflows[0].state == FAILED
+    assert job.workflows[0].error == "unknown state on load"
+    assert job.workflows[1].state == PENDING

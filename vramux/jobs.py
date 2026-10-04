@@ -56,6 +56,8 @@ def default_jobs_file() -> Path:
     return Path(base) / "vramux" / "jobs.json"
 
 
+_STATES = (PENDING, RUNNING, DONE, FAILED, CANCELLED)
+
 
 def _write_file(path: Path, text: str) -> None:
     """tmp + fsync + replace: a job file half-written after a power cut is a
@@ -67,6 +69,59 @@ def _write_file(path: Path, text: str) -> None:
         fh.flush()
         os.fsync(fh.fileno())
     os.replace(tmp, path)
+
+
+class _Unreadable(ValueError):
+    """The job file is not a shape this version wrote."""
+
+
+def _number(value, name: str, optional: bool = False):
+    if value is None and optional:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise _Unreadable(f"{name} is not a number: {value!r}")
+    return float(value)
+
+
+def _typed(value, typ, name: str, optional: bool = False):
+    if value is None and optional:
+        return None
+    if isinstance(value, bool) and typ is int or not isinstance(value, typ):
+        raise _Unreadable(f"{name} is not a {typ.__name__}: {value!r}")
+    return value
+
+
+def _workflow_from(row) -> "Workflow":
+    _typed(row, dict, "a workflow row")
+    state = _typed(row.get("state"), str, "workflow state")
+    wf = Workflow(
+        index=_typed(row.get("index"), int, "workflow index"),
+        # Absent for a finished workflow: its graph is not kept.
+        prompt=_typed(row.get("prompt", {}), dict, "workflow prompt"),
+        state=state,
+        prompt_id=_typed(row.get("prompt_id"), str, "prompt_id", optional=True),
+        outputs=_typed(row.get("outputs", []), list, "outputs"),
+        error=_typed(row.get("error"), str, "error", optional=True),
+        attempts=_typed(row.get("attempts", 0), int, "attempts"),
+    )
+    if state not in _STATES:
+        # A state this version does not know is not a reason to lose the
+        # queue, and not one to guess about either.
+        wf.state, wf.error = FAILED, "unknown state on load"
+    return wf
+
+
+def _job_from(row) -> "Job":
+    _typed(row, dict, "a job row")
+    return Job(
+        id=_typed(row.get("id"), str, "job id"),
+        model=_typed(row.get("model"), str, "job model"),
+        created=_number(row.get("created_wall"), "created_wall"),
+        started=_number(row.get("started_wall"), "started_wall", optional=True),
+        finished=_number(row.get("finished_wall"), "finished_wall", optional=True),
+        cancelled=_typed(row.get("cancelled", False), bool, "cancelled"),
+        workflows=[_workflow_from(w) for w in _typed(row.get("workflows"), list, "workflows")],
+    )
 
 
 def _iso(wall: Optional[float]) -> Optional[str]:
@@ -331,37 +386,40 @@ class JobStore:
     def _load(self) -> None:
         """Take back the queue. Pending stays pending; a running workflow
         keeps its prompt id, for the scheduler to look up once the workflow
-        server is up — it cannot be settled from here."""
+        server is up — it cannot be settled from here.
+
+        A file this version cannot read never stops startup: it is set aside
+        beside itself, named, and the store starts empty. Silently dropping
+        the rows that do not parse would lose jobs without saying which.
+        """
         try:
-            data = json.loads(self._path.read_text())
+            text = self._path.read_text()
         except FileNotFoundError:
             return
-        except (OSError, ValueError) as exc:
+        except OSError as exc:
             log.warning("ignoring unreadable job state %s: %s", self._path, exc)
             return
-        for row in data.get("jobs") or []:
+        try:
+            data = json.loads(text)
+            if not isinstance(data, dict):
+                raise _Unreadable("the top level is not an object")
+            jobs = [_job_from(r) for r in _typed(data.get("jobs", []), list, "jobs")]
+            handovers = _typed(data.get("handovers", []), list, "handovers")
+        except (ValueError, TypeError) as exc:
+            aside = self._path.with_name(f"{self._path.name}.corrupt-{int(time.time())}")
             try:
-                job = Job(
-                    id=str(row["id"]), model=str(row["model"]),
-                    created=float(row["created_wall"]),
-                    started=row.get("started_wall"),
-                    finished=row.get("finished_wall"),
-                    cancelled=bool(row.get("cancelled")),
-                    workflows=[
-                        Workflow(
-                            index=int(w["index"]), prompt=dict(w.get("prompt") or {}),
-                            state=str(w["state"]), prompt_id=w.get("prompt_id"),
-                            outputs=list(w.get("outputs") or []),
-                            error=w.get("error"), attempts=int(w.get("attempts", 0)),
-                        )
-                        for w in row["workflows"]
-                    ],
-                )
-            except (KeyError, TypeError, ValueError) as exc:
-                log.warning("skipping a malformed job row in %s: %s", self._path, exc)
-                continue
+                os.replace(self._path, aside)
+            except OSError:
+                aside = None
+            log.error(
+                "%s is not a job file this vramux can read (%s) — %s; starting empty",
+                self._path, exc,
+                f"set aside as {aside.name}" if aside else "and it could not be set aside",
+            )
+            return
+        for job in jobs:
             self._jobs[job.id] = job
             if not job.terminal:
                 log.info("restored job %s (%s), %d workflow(s) open",
                          job.id, job.state, len(job.open_workflows()))
-        self.handovers = list(data.get("handovers") or [])[-HANDOVER_KEEP:]
+        self.handovers = handovers[-HANDOVER_KEEP:]
