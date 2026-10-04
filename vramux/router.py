@@ -471,6 +471,8 @@ class Router:
         if not isinstance(body, dict):
             return web.json_response({"error": "body must be a JSON object"}, status=400)
         model = body.get("model") or ""
+        if not isinstance(model, str):
+            return web.json_response({"error": "model must be a string"}, status=400)
         spec = self.registry.get(model)
         if spec is None:
             return web.json_response({"error": f"model '{model}' not found"}, status=400)
@@ -557,7 +559,11 @@ class Router:
             body = await request.json()
         except Exception:
             return web.json_response({"error": "body must be JSON"}, status=400)
-        model = (body or {}).get("model") or ""
+        if not isinstance(body, dict):
+            return web.json_response({"error": "body must be a JSON object"}, status=400)
+        model = body.get("model") or ""
+        if not isinstance(model, str):
+            return web.json_response({"error": "model must be a string"}, status=400)
         spec = self.scheduler.job_spec(model)
         if spec is None:
             return web.json_response(

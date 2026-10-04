@@ -491,3 +491,18 @@ async def test_a_waiter_whose_client_left_is_dropped(rig):
     started = time.monotonic()
     resp = await router.job_get(request)
     assert resp.status == 499 and time.monotonic() - started < 2.0
+
+
+@pytest.mark.parametrize("path, body", [
+    ("/gpu/jobs/window", ["stack:1"]),
+    ("/gpu/jobs/window", {"model": 7, "jobs": 1}),
+    ("/gpu/jobs", {"model": 7, "workflow": {"a": {}}}),
+    ("/gpu/jobs", {"model": ["stack:1"], "workflow": {"a": {}}}),
+])
+async def test_a_malformed_body_is_400_not_500(rig, path, body):
+    _fake, build = rig
+    arbiter, stack, _store, sch = build()
+    app = make_app(Reg(stack, spec("llm:27b")), arbiter, scheduler=sch)
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(path, json=body)
+        assert resp.status == 400
