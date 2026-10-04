@@ -37,6 +37,7 @@ from .lease import (
 )
 from .registry import ModelRegistry
 from .residency import BackendLoading, ResidencyArbiter
+from .scheduler import Scheduler
 from .translate import (
     _JSON_GRAMMAR,
     _is_load_request,
@@ -74,6 +75,12 @@ EVENT_KEEPALIVE = max(EVENT_INTERVAL, env.get_float("EVENT_KEEPALIVE", 15.0))
 # points is a shape drawn at a resolution no screen has.
 HISTORY_DEFAULT_MINUTES = 60.0
 HISTORY_MAX_POINTS = 2000
+
+# How long `GET /gpu/jobs/{id}?wait=1` holds the response when the caller does
+# not say, and the most it will hold whatever the caller says. Either way the
+# body is the job as it stands, so a client loops rather than tunes this.
+JOB_WAIT_DEFAULT = 300.0
+JOB_WAIT_MAX = 3600.0
 
 
 ROUTER: "web.AppKey[Router]" = web.AppKey("router")
@@ -174,10 +181,12 @@ class Router:
         registry: ModelRegistry,
         arbiter: ResidencyArbiter,
         broker: Optional[Broker] = None,
+        scheduler: Optional[Scheduler] = None,
     ) -> None:
         self.registry = registry
         self.arbiter = arbiter
         self.broker = broker
+        self.scheduler = scheduler
         self._client_session: Optional[aiohttp.ClientSession] = None
         self.feed = StateFeed(self.state_payload)
 
@@ -192,9 +201,15 @@ class Router:
         if self.broker is not None:
             # Expiry only becomes a guarantee once something is sweeping.
             self.broker.start()
+        if self.scheduler is not None:
+            # After reconcile: the stack a previous process left up is down,
+            # so a restored running workflow is looked up on a fresh stack.
+            self.scheduler.start()
 
     async def cleanup(self, _app: web.Application) -> None:
         await self.feed.close()
+        if self.scheduler is not None:
+            await self.scheduler.close()
         if self._client_session:
             await self._client_session.close()
         if self.broker is not None:
@@ -416,14 +431,153 @@ class Router:
             "resident_detail": _resident_detail(self.arbiter, observer.cache),
             # A load in progress, so a slow cold container reads as a wait
             # rather than as a card that has stopped answering.
-            "loading": self.arbiter.loading,
+            # Requests parked behind a scheduled render read the same way.
+            "loading": self.arbiter.loading or self.arbiter.parked_view,
             "costs": observer.cache.all(),
             # Grants outstanding, and the arithmetic behind them. Residents are
             # accounted for by what the device reports them using, not by a
             # lease — nothing requires a grant to serve a model yet.
             "leases": leases,
             "budget": budget,
+            # The card's two tenants: which one holds it, what is queued for
+            # the other, the typed bounds, and what a handover costs.
+            "scheduler": self.scheduler.state() if self.scheduler else None,
         }
+
+    # ---- render jobs ----------------------------------------------------------
+
+    def _jobs_disabled(self) -> Optional[web.Response]:
+        if self.scheduler is None:
+            return web.json_response({"error": "render jobs are not enabled"}, status=503)
+        return None
+
+    def _job_body(self, job) -> dict:
+        body = job.to_json()
+        body["position"] = self.scheduler.store.position(job)
+        return body
+
+    async def job_submit(self, request: web.Request) -> web.Response:
+        """Queue a batch of workflows and answer at once, whatever holds the card.
+
+        Submitting never waits on the card: the scheduler decides when the
+        batch runs, and `GET /gpu/jobs/{id}?wait=1` is where a caller waits.
+        """
+        if (refusal := self._jobs_disabled()) is not None:
+            return refusal
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "body must be JSON"}, status=400)
+        if not isinstance(body, dict):
+            return web.json_response({"error": "body must be a JSON object"}, status=400)
+        model = body.get("model") or ""
+        spec = self.registry.get(model)
+        if spec is None:
+            return web.json_response({"error": f"model '{model}' not found"}, status=400)
+        if not spec.jobs:
+            return web.json_response(
+                {"error": f"{spec.tag} does not take jobs (no `jobs:` in its config)"},
+                status=400,
+            )
+        workflows = body.get("workflows")
+        if workflows is None and "workflow" in body:
+            workflows = [body["workflow"]]
+        if not isinstance(workflows, list) or not workflows:
+            return web.json_response(
+                {"error": "workflows must be a non-empty list"}, status=400,
+            )
+        for i, wf in enumerate(workflows):
+            if not isinstance(wf, dict) or not wf:
+                return web.json_response(
+                    {"error": f"workflow {i} must be a non-empty JSON object "
+                              f"(an API-format prompt)"},
+                    status=400,
+                )
+        job = self.scheduler.store.submit(spec.tag, workflows)
+        self.scheduler.wake()
+        return web.json_response(
+            {"id": job.id, "state": job.state, "position": self.scheduler.store.position(job)},
+            status=202,
+        )
+
+    async def job_list(self, _request: web.Request) -> web.Response:
+        if (refusal := self._jobs_disabled()) is not None:
+            return refusal
+        return web.json_response(
+            {"jobs": [self._job_body(j) for j in self.scheduler.store.all()]}
+        )
+
+    async def job_get(self, request: web.Request) -> web.Response:
+        if (refusal := self._jobs_disabled()) is not None:
+            return refusal
+        store = self.scheduler.store
+        job = store.get(request.match_info["job_id"])
+        if job is None:
+            return web.json_response({"error": "no such job"}, status=404)
+        if request.query.get("wait") not in (None, "", "0", "false"):
+            try:
+                timeout = float(request.query.get("timeout", JOB_WAIT_DEFAULT))
+            except ValueError:
+                return web.json_response({"error": "timeout must be a number"}, status=400)
+            deadline = time.monotonic() + min(max(0.0, timeout), JOB_WAIT_MAX)
+            while not job.terminal:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                await store.wait_for_change(remaining)
+        return web.json_response(self._job_body(job))
+
+    async def job_cancel(self, request: web.Request) -> web.Response:
+        """Cancel what has not started. A prompt already on the stack runs to
+        the end — interrupting it would interrupt whatever the stack is
+        running, which need not be ours — and its outputs are kept."""
+        if (refusal := self._jobs_disabled()) is not None:
+            return refusal
+        job = self.scheduler.store.get(request.match_info["job_id"])
+        if job is None:
+            return web.json_response({"error": "no such job"}, status=404)
+        self.scheduler.store.cancel(job)
+        self.scheduler.wake()
+        return web.json_response(self._job_body(job))
+
+    async def window_open(self, request: web.Request) -> web.Response:
+        """Hold render mode for a human at the stack's own UI.
+
+        `jobs: N` holds until N prompts complete (the stack's history grows by
+        N); `minutes: T` until its queue has sat empty for T minutes.
+        """
+        if (refusal := self._jobs_disabled()) is not None:
+            return refusal
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "body must be JSON"}, status=400)
+        model = (body or {}).get("model") or ""
+        spec = self.scheduler.job_spec(model)
+        if spec is None:
+            return web.json_response(
+                {"error": f"model '{model}' is not a model that takes jobs"}, status=400,
+            )
+        jobs, minutes = body.get("jobs"), body.get("minutes")
+        try:
+            if (jobs is None) == (minutes is None):
+                raise ValueError("give exactly one of jobs or minutes")
+            if jobs is not None:
+                if isinstance(jobs, bool) or int(jobs) != jobs or jobs < 1:
+                    raise ValueError("jobs must be a positive whole number")
+                jobs = int(jobs)
+            else:
+                if isinstance(minutes, bool) or float(minutes) <= 0:
+                    raise ValueError("minutes must be a positive number")
+                minutes = float(minutes)
+        except (TypeError, ValueError) as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        return web.json_response(self.scheduler.open_window(spec, jobs, minutes))
+
+    async def window_close(self, _request: web.Request) -> web.Response:
+        if (refusal := self._jobs_disabled()) is not None:
+            return refusal
+        return web.json_response({"closed": self.scheduler.close_window()})
 
     # ---- leases ---------------------------------------------------------------
 
@@ -883,9 +1037,10 @@ def make_app(
     registry: ModelRegistry,
     arbiter: ResidencyArbiter,
     broker: Optional[Broker] = None,
+    scheduler: Optional[Scheduler] = None,
 ) -> web.Application:
     app = web.Application(client_max_size=64 * 1024 * 1024)
-    r = Router(registry, arbiter, broker)
+    r = Router(registry, arbiter, broker, scheduler)
     # Reachable from the app so a test can look at the state feed's watchers
     # without going through a socket to ask.
     app[ROUTER] = r
@@ -904,6 +1059,13 @@ def make_app(
     app.router.add_delete("/gpu/lease/{lease_id}", r.lease_release)
     app.router.add_post("/gpu/lease/{lease_id}/renew", r.lease_renew)
     app.router.add_post("/gpu/evict", r.evict)
+    # The window routes before `{job_id}`, which would otherwise match them.
+    app.router.add_post("/gpu/jobs/window", r.window_open)
+    app.router.add_delete("/gpu/jobs/window", r.window_close)
+    app.router.add_post("/gpu/jobs", r.job_submit)
+    app.router.add_get("/gpu/jobs", r.job_list)
+    app.router.add_get("/gpu/jobs/{job_id}", r.job_get)
+    app.router.add_delete("/gpu/jobs/{job_id}", r.job_cancel)
     app.router.add_post("/api/show", r.show)
     app.router.add_post("/api/chat", r.chat)
     app.router.add_post("/api/generate", r.generate)

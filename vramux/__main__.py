@@ -25,6 +25,7 @@ from .lease import (
     clamped_sample_interval,
     default_state_file,
 )
+from .jobs import JobStore, default_jobs_file
 from .observer import CostCache, Observer
 from .registry import ModelRegistry
 from .router import make_app
@@ -36,6 +37,7 @@ from .residency import (
     DEFAULT_YIELD_WAIT,
     ResidencyArbiter,
 )
+from .scheduler import Scheduler
 
 
 def _serve(args: argparse.Namespace) -> None:
@@ -80,7 +82,10 @@ def _serve(args: argparse.Namespace) -> None:
     # memory held by leases that outrank me, worth parking behind — is the
     # broker's to answer.
     arbiter.use_outrankers(broker.outrankers)
-    app = make_app(registry, arbiter, broker)
+    # The card's two tenants. Always built — it does nothing until a model
+    # with `jobs:` has a job — so the job API answers the same on every box.
+    scheduler = Scheduler(registry, arbiter, JobStore(default_jobs_file()))
+    app = make_app(registry, arbiter, broker, scheduler)
     # aiohttp waits 60s by default for open requests to finish before cleanup,
     # and a `vramux top` console or a long generation keeps one open for good.
     # systemd's stop timeout is shorter, so cleanup never ran and the process

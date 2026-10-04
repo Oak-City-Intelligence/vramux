@@ -481,8 +481,9 @@ class ResidencyArbiter:
         """(tag, monotonic since) of every request parked behind a render."""
         return sorted(self._parked.values(), key=lambda p: p[1])
 
-    def arriving(self, tag: str) -> int:
-        return self._arriving.get(tag, 0)
+    def arriving_except(self, tag: str) -> int:
+        """Requests for any model but `tag` that have asked and not been admitted."""
+        return sum(n for t, n in self._arriving.items() if t != tag)
 
     async def _park_for_render(self, spec: ModelSpec) -> None:
         if not self._held_against(spec):
