@@ -113,3 +113,18 @@ async def test_after_the_scheduler_lets_go_the_stack_is_an_ordinary_resident():
     assert not load.done(), "lend_after protects the human's next use"
     load.cancel()
 
+
+async def test_a_parked_request_whose_client_left_is_dropped(monkeypatch):
+    monkeypatch.setattr(residency, "_PARK_POLL", 0.01)
+    sup = QueueArbiter(drain_timeout=0.2, startup_timeout=5.0)
+    sup.hold_render("stack:1")
+    await sup.acquire(stack(), scheduled=True)
+    gone = {"yes": False}
+    load = asyncio.create_task(sup.acquire(spec("llm:27b"), gone=lambda: gone["yes"]))
+    await asyncio.sleep(0.05)
+    assert len(sup.parked) == 1
+    gone["yes"] = True
+    with pytest.raises(residency.ClientGone):
+        await asyncio.wait_for(load, 1)
+    assert sup.parked == [], "it no longer counts toward llm_latency_bound"
+    assert sup.arriving_except("stack:1") == 0

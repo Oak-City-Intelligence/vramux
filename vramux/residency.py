@@ -95,6 +95,14 @@ _WAIT_LOG_INTERVAL = 15.0
 _WAIT_SLACK = 30.0
 
 
+class ClientGone(RuntimeError):
+    """The client of a request parked behind a render went away.
+
+    Raised so the park ends instead of holding a slot — and a place in the
+    latency bound's arithmetic — for somebody who is no longer waiting.
+    """
+
+
 class BackendLoading(RuntimeError):
     """A load is in progress and did not finish within its own budget.
 
@@ -383,7 +391,7 @@ class ResidencyArbiter:
 
     async def acquire(
         self, spec: ModelSpec, *, scheduled: bool = False,
-        timings: Optional[Dict[str, float]] = None,
+        timings: Optional[Dict[str, float]] = None, gone=None,
     ) -> None:
         """Ensure `spec` is resident and register one in-flight request on it.
 
@@ -396,6 +404,8 @@ class ResidencyArbiter:
         render hold, its resident is marked `scheduled`, and what it displaces
         is not remembered for a restore. `timings`, when given, gets the
         seconds spent making room (`evict_s`) and starting (`load_s`).
+        `gone`, a callable, says whether the caller's client has left; a
+        request parked behind a render checks it and raises `ClientGone`.
         """
         began = time.monotonic()
         if not scheduled:
@@ -404,7 +414,7 @@ class ResidencyArbiter:
         try:
             while True:
                 if not scheduled:
-                    await self._park_for_render(spec)
+                    await self._park_for_render(spec, gone)
                 await self._admit()
                 if scheduled or not self._held_against(spec):
                     break
@@ -490,7 +500,7 @@ class ResidencyArbiter:
         """Requests for any model but `tag` that have asked and not been admitted."""
         return sum(n for t, n in self._arriving.items() if t != tag)
 
-    async def _park_for_render(self, spec: ModelSpec) -> None:
+    async def _park_for_render(self, spec: ModelSpec, gone=None) -> None:
         if not self._held_against(spec):
             return
         key = id(asyncio.current_task())
@@ -499,8 +509,18 @@ class ResidencyArbiter:
         log.info("%s parks behind render jobs on %s", spec.tag, self._render_hold)
         try:
             while self._held_against(spec):
-                await self._render_open.wait()
+                if gone is not None and gone():
+                    log.info("%s: client left after %.0fs parked behind render",
+                             spec.tag, time.monotonic() - since)
+                    raise ClientGone(f"the client asking for {spec.tag} went away")
+                try:
+                    # Polled, not a bare wait: a client that disconnects does
+                    # not cancel its handler, so the park has to look.
+                    await asyncio.wait_for(self._render_open.wait(), timeout=_PARK_POLL)
+                except asyncio.TimeoutError:
+                    pass
         finally:
+            # Cancellation lands here too: a dropped request stops counting.
             self._parked.pop(key, None)
         log.info("%s: render over after %.0fs parked", spec.tag, time.monotonic() - since)
 

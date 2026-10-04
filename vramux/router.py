@@ -36,7 +36,7 @@ from .lease import (
     UnknownLease,
 )
 from .registry import ModelRegistry
-from .residency import BackendLoading, ResidencyArbiter
+from .residency import BackendLoading, ClientGone, ResidencyArbiter
 from .scheduler import Scheduler
 from .translate import (
     _JSON_GRAMMAR,
@@ -520,11 +520,16 @@ class Router:
             except ValueError:
                 return web.json_response({"error": "timeout must be a number"}, status=400)
             deadline = time.monotonic() + min(max(0.0, timeout), JOB_WAIT_MAX)
+            gone = _gone(request)
             while not job.terminal:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
-                await store.wait_for_change(remaining)
+                if gone is not None and gone():
+                    return _client_gone()
+                # Woken by every change, and at least once a second to look
+                # for a client that has left.
+                await store.wait_for_change(min(remaining, 1.0))
         return web.json_response(self._job_body(job))
 
     async def job_cancel(self, request: web.Request) -> web.Response:
@@ -692,11 +697,13 @@ class Router:
         if _is_unload_request(body):
             return await self._handle_unload(model, spec)
         if _is_load_request(body):
-            return await self._handle_load(model, spec)
+            return await self._handle_load(model, spec, request)
         try:
-            await self.arbiter.acquire(spec)
+            await self.arbiter.acquire(spec, gone=_gone(request))
         except BackendLoading as exc:
             return _still_loading(exc)
+        except ClientGone:
+            return _client_gone()
         try:
             stream = bool(body.get("stream", True))
             upstream_payload = {
@@ -730,11 +737,13 @@ class Router:
         if _is_unload_request(body):
             return await self._handle_unload(model, spec)
         if _is_load_request(body):
-            return await self._handle_load(model, spec)
+            return await self._handle_load(model, spec, request)
         try:
-            await self.arbiter.acquire(spec)
+            await self.arbiter.acquire(spec, gone=_gone(request))
         except BackendLoading as exc:
             return _still_loading(exc)
+        except ClientGone:
+            return _client_gone()
         try:
             stream = bool(body.get("stream", True))
             want_json = body.get("format") == "json"
@@ -761,9 +770,11 @@ class Router:
         if not spec:
             return web.json_response({"error": f"model '{model}' not found"}, status=404)
         try:
-            await self.arbiter.acquire(spec)
+            await self.arbiter.acquire(spec, gone=_gone(request))
         except BackendLoading as exc:
             return _still_loading(exc)
+        except ClientGone:
+            return _client_gone()
         try:
             inp = body.get("prompt") or body.get("input") or ""
             upstream_payload = {"model": spec.served_name, "input": inp}
@@ -778,7 +789,7 @@ class Router:
         finally:
             self.arbiter.release(spec.tag)
 
-    async def _handle_load(self, model: str, spec) -> web.Response:
+    async def _handle_load(self, model: str, spec, request=None) -> web.Response:
         """Load one model and answer — ollama's empty-prompt warm-up.
 
         Admission runs in full: room is made, the backend comes up, health is
@@ -787,9 +798,11 @@ class Router:
         reached on its own port afterwards, or through `/m/{tag}/...`.
         """
         try:
-            await self.arbiter.acquire(spec)
+            await self.arbiter.acquire(spec, gone=_gone(request))
         except BackendLoading as exc:
             return _still_loading(exc)
+        except ClientGone:
+            return _client_gone()
         self.arbiter.release(spec.tag)
         return web.json_response({
             "model": model,
@@ -829,9 +842,11 @@ class Router:
         if not spec:
             return web.json_response({"error": f"model '{model}' not found"}, status=404)
         try:
-            await self.arbiter.acquire(spec)
+            await self.arbiter.acquire(spec, gone=_gone(request))
         except BackendLoading as exc:
             return _still_loading(exc)
+        except ClientGone:
+            return _client_gone()
         try:
             body["model"] = spec.served_name
 
@@ -879,9 +894,11 @@ class Router:
                 status=501,
             )
         try:
-            await self.arbiter.acquire(spec)
+            await self.arbiter.acquire(spec, gone=_gone(request))
         except BackendLoading as exc:
             return _still_loading(exc)
+        except ClientGone:
+            return _client_gone()
         try:
             path = request.match_info.get("path", "")
             upstream_url = f"{self.arbiter.upstream_for(spec.tag)}/{path}"
@@ -1002,6 +1019,28 @@ def _resident_detail(arbiter, cache) -> List[dict]:
             "server_bin": str(resident.spec.server_bin) if resident.spec.server_bin else None,
         })
     return rows
+
+
+def _gone(request):
+    """A callable saying whether `request`'s client has left, or None.
+
+    aiohttp does not cancel a handler when its client disconnects, so a
+    request parked behind a render would otherwise wait out the render for
+    nobody — and count toward the latency bound while it did.
+    """
+    if request is None or not hasattr(request, "transport"):
+        return None
+
+    def gone() -> bool:
+        transport = request.transport
+        return transport is None or transport.is_closing()
+
+    return gone
+
+
+def _client_gone() -> web.Response:
+    # Nobody is listening; the status is for the access log.
+    return web.json_response({"error": "client went away"}, status=499)
 
 
 def _still_loading(exc: BackendLoading) -> web.Response:

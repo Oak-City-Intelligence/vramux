@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from types import SimpleNamespace
 
 import pytest
 from aiohttp import web
@@ -18,7 +19,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from vramux import residency, scheduler as sched_mod
 from vramux.jobs import DONE, FAILED, PENDING, RUNNING, JobStore
 from vramux.registry import KIND_DOCKER
-from vramux.router import make_app
+from vramux.router import ROUTER, make_app
 from vramux.scheduler import LLM, RENDER, Scheduler
 
 from test_polite_exclusive import QueueArbiter
@@ -471,3 +472,22 @@ async def test_closing_mid_render_leaves_no_hold(rig, monkeypatch):
     await until(lambda: fake.prompts)
     await sch.close()
     assert arbiter.render_hold is None and sch._watch is None
+
+
+async def test_a_waiter_whose_client_left_is_dropped(rig):
+    _fake, build = rig
+    arbiter, stack, store, sch = build()
+    job = store.submit(STACK, [{"a": {}}])
+    router = make_app(Reg(stack, spec("llm:27b")), arbiter, scheduler=sch)[ROUTER]
+
+    class Closed:
+        def is_closing(self):
+            return True
+
+    request = SimpleNamespace(
+        match_info={"job_id": job.id}, query={"wait": "1", "timeout": "5"},
+        transport=Closed(),
+    )
+    started = time.monotonic()
+    resp = await router.job_get(request)
+    assert resp.status == 499 and time.monotonic() - started < 2.0
