@@ -358,6 +358,7 @@ async def test_a_restart_keeps_pending_and_settles_running(rig, tmp_path, monkey
         first.mark_running(job, wf)
         wf.prompt_id, wf.attempts = pid, attempts
     first.changed()
+    await first.flush()
     # The stack finished `a` before the restart; `b` and `d` it never kept.
     fake.history["old-done"] = {
         "outputs": {"9": {"images": [{"filename": "a.png", "subfolder": "", "type": "output"}]}},

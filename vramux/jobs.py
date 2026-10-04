@@ -56,6 +56,19 @@ def default_jobs_file() -> Path:
     return Path(base) / "vramux" / "jobs.json"
 
 
+
+def _write_file(path: Path, text: str) -> None:
+    """tmp + fsync + replace: a job file half-written after a power cut is a
+    queue that is gone. Run off the event loop — an fsync can take a while."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w") as fh:
+        fh.write(text)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
 def _iso(wall: Optional[float]) -> Optional[str]:
     if wall is None:
         return None
@@ -133,6 +146,11 @@ class JobStore:
         # Woken on every transition. A `?wait=1` caller sleeps on it rather
         # than polling the store.
         self._changed = asyncio.Event()
+        # Writes go to a thread, one at a time, and a burst of transitions
+        # becomes one write of the latest state.
+        self._dirty = False
+        self._writer: Optional[asyncio.Task] = None
+        self._write_lock = asyncio.Lock()
         if path is not None:
             self._load()
 
@@ -261,29 +279,54 @@ class JobStore:
 
     # ---- persistence ----------------------------------------------------------
 
-    def _save(self) -> None:
-        """Same shape as the lease file's writer, plus an fsync: a job file
-        that is half-written after a power cut is a queue that is gone."""
-        if self._path is None:
-            return
+    def _serialise(self) -> str:
+        """The file's contents, taken on the event loop so it is one moment's
+        state. A finished workflow drops its graph — a batch of large
+        workflows would otherwise grow the file with prompts nothing will
+        run again — and keeps its outputs and error."""
         rows = []
         for job in self._jobs.values():
-            row = job.to_json(with_prompt=True)
-            row.update({
+            rows.append({
+                "id": job.id, "model": job.model,
                 "created_wall": job.created, "started_wall": job.started,
                 "finished_wall": job.finished, "cancelled": job.cancelled,
+                "workflows": [
+                    w.to_json(with_prompt=w.state not in TERMINAL) for w in job.workflows
+                ],
             })
-            rows.append(row)
+        return json.dumps({"jobs": rows, "handovers": self.handovers})
+
+    def _save(self) -> None:
+        if self._path is None:
+            return
         try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self._path.with_suffix(".tmp")
-            with open(tmp, "w") as fh:
-                fh.write(json.dumps({"jobs": rows, "handovers": self.handovers}))
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp, self._path)
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is None:
+            # No loop to hand the write to (a CLI, a test): write it here.
+            self._write(self._serialise())
+            return
+        self._dirty = True
+        if self._writer is None or self._writer.done():
+            self._writer = loop.create_task(self._drain_writes())
+
+    def _write(self, text: str) -> None:
+        try:
+            _write_file(self._path, text)
         except OSError as exc:
             log.warning("could not write job state to %s: %s", self._path, exc)
+
+    async def _drain_writes(self) -> None:
+        async with self._write_lock:
+            while self._dirty:
+                self._dirty = False
+                await asyncio.to_thread(self._write, self._serialise())
+
+    async def flush(self) -> None:
+        """Wait for every change so far to reach the disk."""
+        while self._writer is not None and not self._writer.done():
+            await self._writer
 
     def _load(self) -> None:
         """Take back the queue. Pending stays pending; a running workflow
@@ -306,7 +349,7 @@ class JobStore:
                     cancelled=bool(row.get("cancelled")),
                     workflows=[
                         Workflow(
-                            index=int(w["index"]), prompt=dict(w["prompt"]),
+                            index=int(w["index"]), prompt=dict(w.get("prompt") or {}),
                             state=str(w["state"]), prompt_id=w.get("prompt_id"),
                             outputs=list(w.get("outputs") or []),
                             error=w.get("error"), attempts=int(w.get("attempts", 0)),

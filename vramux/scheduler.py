@@ -189,6 +189,7 @@ class Scheduler:
         if self._session is not None:
             await self._session.close()
             self._session = None
+        await self.store.flush()
 
     def wake(self) -> None:
         self._wake.set()

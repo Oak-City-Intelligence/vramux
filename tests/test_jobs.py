@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import time
 
+import pytest
+
 from vramux import jobs as jobs_mod
 from vramux.jobs import CANCELLED, DONE, FAILED, PENDING, RUNNING, JobStore
 
@@ -81,3 +83,37 @@ def test_the_file_honours_its_override(monkeypatch, tmp_path):
     monkeypatch.delenv("VRAMUX_JOBS_FILE")
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
     assert jobs_mod.default_jobs_file() == tmp_path / "vramux" / "jobs.json"
+
+
+# ---- writing ------------------------------------------------------------------
+
+
+def test_a_finished_workflow_is_persisted_without_its_graph(tmp_path):
+    store = JobStore(tmp_path / "jobs.json")
+    job = store.submit("img:1", [{"big": {"graph": 1}}, {"next": {}}])
+    store.mark_done(job, job.workflows[0], [{"filename": "a.png"}])
+    rows = json.loads((tmp_path / "jobs.json").read_text())["jobs"][0]["workflows"]
+    assert "prompt" not in rows[0] and rows[0]["outputs"] == [{"filename": "a.png"}]
+    assert rows[1]["prompt"] == {"next": {}}, "an open workflow keeps what it needs to run"
+    again = JobStore(tmp_path / "jobs.json").get(job.id)
+    assert again.workflows[0].state == DONE and again.workflows[0].prompt == {}
+
+
+async def test_writes_leave_the_event_loop_and_bursts_coalesce(tmp_path, monkeypatch):
+    import threading
+
+    writes = []
+    real = jobs_mod._write_file
+
+    def counting(path, text):
+        writes.append(threading.current_thread() is threading.main_thread())
+        real(path, text)
+
+    monkeypatch.setattr(jobs_mod, "_write_file", counting)
+    store = JobStore(tmp_path / "jobs.json")
+    jobs = [store.submit("img:1", [{"n": i}]) for i in range(20)]
+    await store.flush()
+    assert 1 <= len(writes) <= 2, f"twenty changes, {len(writes)} writes"
+    assert not any(writes), "the write ran on the event loop's thread"
+    on_disk = json.loads((tmp_path / "jobs.json").read_text())
+    assert len(on_disk["jobs"]) == 20 and jobs[-1].id in {r["id"] for r in on_disk["jobs"]}
