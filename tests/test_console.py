@@ -461,3 +461,47 @@ def test_a_lease_being_asked_to_yield_outranks_the_outstanding_mark():
     drawn = text(lines)
     assert "asked for 6 000 MiB by serving:big:27b" in drawn
     assert "30s left" in drawn, "the holder's deadline counts down"
+
+
+# ---- render jobs -------------------------------------------------------------
+
+
+def _sched(**overrides) -> dict:
+    payload = {
+        "mode": "llm", "model": None, "pending_jobs": 2, "pending_workflows": 5,
+        "oldest_age_s": 190, "parked": 0, "window": None,
+        "bounds": {"model": "stack:1", "render_start_deadline_s": 600.0,
+                   "render_batch_trigger": None, "llm_latency_bound_s": None},
+        "handover": {"to_render": {"last": 14.2, "median": 12.0, "n": 3},
+                     "to_llm": {"last": None, "median": None, "n": 0}},
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_the_scheduler_is_drawn_with_its_bounds_and_handovers():
+    drawn = text(render(state(scheduler=_sched()), width=120, now=NOON))
+    assert "RENDER stack:1  mode llm   2 job(s), 5 workflow(s) pending, oldest 3m" in drawn
+    assert "start deadline 600s   batch off   llm latency off" in drawn
+    assert "llm->render 12.0s (n 3, last 14.2s)   render->llm —" in drawn
+
+
+def test_render_mode_is_loud_and_a_window_says_what_holds_it():
+    lines = render(state(scheduler=_sched(
+        mode="render", window={"model": "stack:1", "jobs": 4, "minutes": None, "done": 1})),
+        width=120, now=NOON)
+    assert styles(lines, "RENDER stack:1") == "hot"
+    assert "window open: 1/4 prompt(s)" in text(lines)
+
+
+def test_no_jobs_model_draws_no_scheduler():
+    sched = _sched(bounds={"model": None})
+    assert "RENDER" not in text(render(state(scheduler=sched), now=NOON))
+
+
+def test_a_request_parked_behind_a_render_says_so():
+    drawn = text(render(state(loading={
+        "tag": "llm:27b", "elapsed_s": 40.0, "budget_s": None,
+        "behind": "render jobs on stack:1", "parked": 3}), width=120, now=NOON))
+    assert "llm:27b (+2) queued behind render jobs on stack:1 — 40.0s" in drawn
+    assert "of None" not in drawn

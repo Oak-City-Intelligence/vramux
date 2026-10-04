@@ -280,9 +280,19 @@ def render(state: Optional[dict], width: int = 80, height: int = 24,
 
     loading = state.get("loading")
     if loading:
-        lines.append(Line(_clip(
-            f" loading {loading.get('tag', '?')} — {loading.get('elapsed_s', 0)}s"
-            f" of {loading.get('budget_s', 0)}s", width), "warn"))
+        of = f" of {loading['budget_s']}s" if loading.get("budget_s") is not None else ""
+        if loading.get("behind"):
+            more = loading.get("parked", 1) - 1
+            lines.append(Line(_clip(
+                f" {loading.get('tag', '?')}{f' (+{more})' if more > 0 else ''}"
+                f" queued behind {loading['behind']} — {loading.get('elapsed_s', 0)}s{of}",
+                width), "warn"))
+        else:
+            lines.append(Line(_clip(
+                f" loading {loading.get('tag', '?')} — {loading.get('elapsed_s', 0)}s{of}",
+                width), "warn"))
+
+    lines.extend(_scheduler_lines(state.get("scheduler"), width))
 
     # ---- residents
     lines.append(Line(""))
@@ -358,6 +368,55 @@ def render(state: Optional[dict], width: int = 80, height: int = 24,
         lines.append(Line(""))
         lines.append(Line(_clip(
             f" unlocated: {', '.join(unlocated)}", width), "warn"))
+    return lines
+
+
+def _seconds(value) -> str:
+    """A typed bound as it was typed, or "off" for one that was not."""
+    if value is None:
+        return "off"
+    return f"{value:g}s" if isinstance(value, (int, float)) else str(value)
+
+
+def _scheduler_lines(sched: Optional[dict], width: int) -> List[Line]:
+    """Which tenant holds the card, what waits for the other, and the price
+    of a flip. Nothing at all on a router with no model that takes jobs."""
+    if not sched or not (sched.get("bounds") or {}).get("model"):
+        return []
+    bounds = sched.get("bounds") or {}
+    handover = sched.get("handover") or {}
+    pending_w = sched.get("pending_workflows") or 0
+    oldest = sched.get("oldest_age_s")
+    head = (
+        f" RENDER {bounds['model']}  mode {sched.get('mode', '?')}"
+        f"   {sched.get('pending_jobs', 0)} job(s), {pending_w} workflow(s) pending"
+    )
+    if oldest is not None:
+        head += f", oldest {_duration(oldest)}"
+    batch = bounds.get("render_batch_trigger")
+    lines = [
+        Line(""),
+        Line(_clip(head, width), "hot" if sched.get("mode") == "render" else "head"),
+        Line(_clip(
+            f"   start deadline {_seconds(bounds.get('render_start_deadline_s'))}"
+            f"   batch {batch if batch is not None else 'off'}"
+            f"   llm latency {_seconds(bounds.get('llm_latency_bound_s'))}", width)),
+    ]
+
+    def median(row: dict) -> str:
+        if not row or not row.get("n"):
+            return "—"
+        return f"{row['median']}s (n {row['n']}, last {row['last']}s)"
+
+    lines.append(Line(_clip(
+        f"   handover llm->render {median(handover.get('to_render'))}"
+        f"   render->llm {median(handover.get('to_llm'))}", width), "dim"))
+    window = sched.get("window")
+    if window:
+        held = (f"{window.get('done', 0)}/{window['jobs']} prompt(s)"
+                if window.get("jobs") is not None
+                else f"until {_seconds((window.get('minutes') or 0) * 60)} idle")
+        lines.append(Line(_clip(f"   window open: {held}", width), "warn"))
     return lines
 
 

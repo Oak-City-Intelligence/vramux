@@ -191,8 +191,11 @@ function draw() {
   const loading = document.getElementById("loading");
   loading.hidden = !state.loading;
   if (state.loading) {
-    loading.textContent =
-      `loading ${state.loading.tag} — ${state.loading.elapsed_s}s of ${state.loading.budget_s}s`;
+    const l = state.loading;
+    const of = l.budget_s == null ? "" : ` of ${l.budget_s}s`;
+    loading.textContent = l.behind
+      ? `${l.tag} queued behind ${l.behind} — ${l.elapsed_s}s${of}`
+      : `loading ${l.tag} — ${l.elapsed_s}s${of}`;
   }
 
   const residents = state.resident_detail
