@@ -86,7 +86,7 @@ async def test_what_a_render_displaces_is_not_remembered():
     sup.hold_render("stack:1")
     await sup.acquire(img, scheduled=True, timings=timings)
     assert not sup._displaced
-    assert set(timings) == {"evict_s", "load_s"}
+    assert {"evict_s", "load_s"} <= set(timings)
 
 
 async def test_after_the_scheduler_lets_go_the_stack_is_an_ordinary_resident():

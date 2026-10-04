@@ -697,3 +697,19 @@ async def test_a_request_parked_at_flip_back_is_admitted_before_the_next_flip(ri
     await until(lambda: late.terminal)
     assert order[:3] == ["hold", "chat admitted", "hold"], order
 
+
+async def test_a_refusal_to_make_room_backs_off_but_fails_no_job(rig, monkeypatch):
+    _fake, build = rig
+    monkeypatch.setattr(sched_mod, "QUIET_GRACE", 0.0)
+    monkeypatch.setattr(sched_mod, "_FLIP_RETRY", 0.01)
+    arbiter, _stack, store, sch = build()
+
+    async def outranked(spec):
+        raise residency.InsufficientVRAM("lease L1 (batch, priority 9) outranks serving")
+
+    monkeypatch.setattr(arbiter, "_make_room_for", outranked)
+    job = store.submit(STACK, [{"a": {}}])
+    sch.start()
+    await until(lambda: sch._failures >= 4)
+    assert job.state == PENDING, "the stack never failed to start; nothing is failed"
+    assert sch._failed_starts == 0

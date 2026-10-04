@@ -365,9 +365,13 @@ class Scheduler:
             wait = self._failed()
             log.warning("could not flip to render for %s (failure %d in a row): %s "
                         "— retrying in %.0fs", spec.tag, self._failures, exc, wait)
-            self._failed_starts += 1
-            if self._failed_starts % _STARTS_PER_JOB == 0:
-                self._fail_head_job(spec, self._failed_starts)
+            # Only the stack failing to come up counts against a job. A lease
+            # that outranks the load, or a load still in progress, is the card
+            # being busy: back off, but nobody's job is at fault.
+            if timings.get("stage") == "start":
+                self._failed_starts += 1
+                if self._failed_starts % _STARTS_PER_JOB == 0:
+                    self._fail_head_job(spec, self._failed_starts)
             return
         self._failures = self._failed_starts = 0
         total = time.monotonic() - decided

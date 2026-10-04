@@ -424,6 +424,8 @@ class ResidencyArbiter:
         if not scheduled:
             self.last_arrival[spec.tag] = began
             self._arriving[spec.tag] = self._arriving.get(spec.tag, 0) + 1
+        if timings is not None:
+            timings["stage"] = "admit"
         try:
             while True:
                 if not scheduled:
@@ -459,8 +461,14 @@ class ResidencyArbiter:
                 await self._stop_resident(resident)
                 resident = None
             if resident is None:
+                if timings is not None:
+                    timings["stage"] = "room"
                 await self._make_room_for(spec)
                 roomed = time.monotonic()
+                if timings is not None:
+                    # Only a failure from here on is the backend failing to
+                    # come up; a refusal to make room is the card being busy.
+                    timings["stage"] = "start"
                 resident = await self._start_with_retry(spec)
                 loaded = time.monotonic()
             else:
