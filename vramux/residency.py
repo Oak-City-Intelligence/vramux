@@ -134,6 +134,11 @@ class Resident:
     # Monotonic time its busy_path queue was last seen non-empty, or it came
     # up, whichever is later. `lend_after` counts from here.
     last_busy: float = 0.0
+    # Held by the render scheduler. Its lend_after is waived — nobody is about
+    # to queue a job on it, the scheduler already has — and a load that
+    # displaces it does not remember it for `restore_after`: bringing it back
+    # for nobody is the flap the scheduler exists to stop.
+    scheduled: bool = False
 
     def __post_init__(self) -> None:
         self.drained.set()
@@ -238,6 +243,22 @@ class ResidencyArbiter:
         self._loading: Optional[Loading] = None
         self._lock = asyncio.Lock()
         self._idle_task: Optional[asyncio.Task] = None
+        # The render scheduler's hold on the card: the tag it holds, and an
+        # event set whenever nothing is held. Every other acquire parks on it
+        # before taking the lock — not under the lock, so parked requests do
+        # not stack on `_admit` and time out there.
+        self._render_hold: Optional[str] = None
+        self._render_open = asyncio.Event()
+        self._render_open.set()
+        self._parked: Dict[int, tuple] = {}
+        # True only inside a scheduled acquire, which holds the lock: what it
+        # displaces is not remembered for a restore.
+        self._scheduling = False
+        # When each tag last asked for the card, and how many of its requests
+        # are between asking and being admitted. The scheduler reads these to
+        # tell a quiet card from one whose next request is already on its way.
+        self.last_arrival: Dict[str, float] = {}
+        self._arriving: Dict[str, int] = {}
 
     def use_yield(self, request_yield) -> None:
         """Hand residency the broker's `request_yield()`.
@@ -355,16 +376,41 @@ class ResidencyArbiter:
 
     # ---- admission ------------------------------------------------------------
 
-    async def acquire(self, spec: ModelSpec) -> None:
+    async def acquire(
+        self, spec: ModelSpec, *, scheduled: bool = False,
+        timings: Optional[Dict[str, float]] = None,
+    ) -> None:
         """Ensure `spec` is resident and register one in-flight request on it.
 
         If room has to be made, the eviction is deferred until the *victim's*
         own in-flight requests have drained — so a streaming response is never
         killed underneath its caller. Every successful acquire() MUST be paired
         with exactly one release().
+
+        `scheduled` is the render scheduler's own acquire: it passes the
+        render hold, its resident is marked `scheduled`, and what it displaces
+        is not remembered for a restore. `timings`, when given, gets the
+        seconds spent making room (`evict_s`) and starting (`load_s`).
         """
-        await self._admit()
+        began = time.monotonic()
+        if not scheduled:
+            self.last_arrival[spec.tag] = began
+            self._arriving[spec.tag] = self._arriving.get(spec.tag, 0) + 1
         try:
+            while True:
+                if not scheduled:
+                    await self._park_for_render(spec)
+                await self._admit()
+                if scheduled or not self._held_against(spec):
+                    break
+                # The hold was taken while this request queued on the lock.
+                self._lock.release()
+        finally:
+            if not scheduled:
+                self._arriving[spec.tag] -= 1
+        try:
+            self._scheduling = scheduled
+            roomed = loaded = time.monotonic()
             resident = self._residents.get(spec.tag)
             if resident is not None and not resident.backend.alive():
                 await self._stop_resident(resident)
@@ -386,13 +432,90 @@ class ResidencyArbiter:
                 resident = None
             if resident is None:
                 await self._make_room_for(spec)
+                roomed = time.monotonic()
                 resident = await self._start_with_retry(spec)
+                loaded = time.monotonic()
+            else:
+                roomed = loaded = time.monotonic()
             self._displaced.pop(spec.tag, None)
+            if scheduled:
+                resident.scheduled = True
+            elif self._render_hold is None:
+                # Somebody asked for it by hand: its own protections are back.
+                resident.scheduled = False
             resident.inflight += 1
             resident.drained.clear()
             resident.last_use = time.monotonic()
+            if timings is not None:
+                timings["evict_s"] = roomed - began
+                timings["load_s"] = loaded - roomed
         finally:
+            self._scheduling = False
             self._lock.release()
+
+    # ---- the render scheduler's hold --------------------------------------------
+
+    def hold_render(self, tag: str) -> None:
+        """Park every acquire of anything but `tag` until `release_render()`.
+
+        No cap, unlike a park behind a lease or a busy queue: the scheduler
+        bounds a render window itself (`llm_latency_bound`), and a render can
+        legitimately outlast any fixed number picked here.
+        """
+        self._render_hold = tag
+        self._render_open.clear()
+
+    def release_render(self) -> None:
+        self._render_hold = None
+        self._render_open.set()
+
+    @property
+    def render_hold(self) -> Optional[str]:
+        return self._render_hold
+
+    def _held_against(self, spec: ModelSpec) -> bool:
+        return self._render_hold is not None and spec.tag != self._render_hold
+
+    @property
+    def parked(self) -> List[tuple]:
+        """(tag, monotonic since) of every request parked behind a render."""
+        return sorted(self._parked.values(), key=lambda p: p[1])
+
+    def arriving(self, tag: str) -> int:
+        return self._arriving.get(tag, 0)
+
+    async def _park_for_render(self, spec: ModelSpec) -> None:
+        if not self._held_against(spec):
+            return
+        key = id(asyncio.current_task())
+        since = time.monotonic()
+        self._parked[key] = (spec.tag, since)
+        log.info("%s parks behind render jobs on %s", spec.tag, self._render_hold)
+        try:
+            while self._held_against(spec):
+                await self._render_open.wait()
+        finally:
+            self._parked.pop(key, None)
+        log.info("%s: render over after %.0fs parked", spec.tag, time.monotonic() - since)
+
+    @property
+    def parked_view(self) -> Optional[Dict[str, object]]:
+        """Parked requests in the shape of `loading`, for the console.
+
+        Kept out of `loading` itself: the broker reads that to refuse grants
+        while a load is in flight, and a render is not a load.
+        """
+        parked = self.parked
+        if not parked:
+            return None
+        tag, since = parked[0]
+        return {
+            "tag": tag,
+            "elapsed_s": round(time.monotonic() - since, 1),
+            "budget_s": None,
+            "behind": f"render jobs on {self._render_hold}",
+            "parked": len(parked),
+        }
 
     def release(self, tag: Optional[str] = None) -> None:
         """Mark one in-flight request complete; wake a waiting eviction at zero.
@@ -725,7 +848,11 @@ class ResidencyArbiter:
             log.info("evicting %s", resident.tag)
         else:
             log.info("swapping model: %s -> %s", resident.tag, incoming.tag)
-            if resident.spec.restore_after is not None:
+            if (
+                resident.spec.restore_after is not None
+                and not resident.scheduled
+                and not self._scheduling
+            ):
                 self._displaced[resident.tag] = resident.spec
                 log.info(
                     "%s is lent to %s and comes back once the card is free "
@@ -752,7 +879,7 @@ class ResidencyArbiter:
     def _settling(self, resident: Resident) -> float:
         """Seconds left before an idle resident may be lent; 0 if it may be now."""
         window = resident.spec.lend_after
-        if not window:
+        if not window or resident.scheduled:
             return 0.0
         return max(0.0, resident.last_busy + window - time.monotonic())
 
