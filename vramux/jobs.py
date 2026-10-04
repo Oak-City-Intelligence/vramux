@@ -1,0 +1,324 @@
+"""Render jobs: what was asked for, how far it got, and what came out.
+
+A job is a *batch*: one submit carries every workflow a caller wants rendered,
+and the scheduler runs them all under one handover of the card each way. Each
+workflow is one workflow-server prompt with its own state, because a batch of
+eight where the fifth fails still has seven results to hand back.
+
+The store is bookkeeping only — it never talks to the card or the workflow
+server. `scheduler.py` moves jobs through it, and every transition is written
+to disk before anything else happens, for the reason `lease.py` writes its
+leases: a restart that forgets a queued job has silently dropped somebody's
+work, and a restart that forgets a *running* one cannot tell whether to look
+for the result or submit it again.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import time
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+log = logging.getLogger("vramux.jobs")
+
+PENDING = "pending"
+RUNNING = "running"
+DONE = "done"
+FAILED = "failed"
+CANCELLED = "cancelled"
+TERMINAL = (DONE, FAILED, CANCELLED)
+
+# How long a finished job is kept for `GET /gpu/jobs/{id}`, and the most kept
+# at once. A caller polls for its result within minutes; a day is generous,
+# and the count bounds the file for a queue that runs hundreds a day.
+FINISHED_KEEP_S = 24 * 3600.0
+FINISHED_KEEP_MAX = 200
+
+# Handovers remembered for the medians `vramux top` prints.
+HANDOVER_KEEP = 20
+
+# Submissions of one workflow before it is failed rather than resubmitted. Two:
+# the original, and one more after the workflow server restarted and lost it.
+MAX_ATTEMPTS = 2
+
+
+def default_jobs_file() -> Path:
+    override = os.environ.get("VRAMUX_JOBS_FILE")
+    if override:
+        return Path(override).expanduser()
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return Path(base) / "vramux" / "jobs.json"
+
+
+def _iso(wall: Optional[float]) -> Optional[str]:
+    if wall is None:
+        return None
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(wall))
+
+
+@dataclass
+class Workflow:
+    """One prompt of a batch."""
+
+    index: int
+    prompt: Dict[str, Any]
+    state: str = PENDING
+    prompt_id: Optional[str] = None
+    outputs: List[Dict[str, Any]] = field(default_factory=list)
+    error: Optional[str] = None
+    attempts: int = 0
+
+    def to_json(self, with_prompt: bool = True) -> Dict[str, Any]:
+        row = {
+            "index": self.index, "state": self.state, "prompt_id": self.prompt_id,
+            "outputs": self.outputs, "error": self.error, "attempts": self.attempts,
+        }
+        if with_prompt:
+            row["prompt"] = self.prompt
+        return row
+
+
+@dataclass
+class Job:
+    id: str
+    model: str
+    workflows: List[Workflow]
+    created: float
+    started: Optional[float] = None
+    finished: Optional[float] = None
+    cancelled: bool = False
+
+    @property
+    def state(self) -> str:
+        """Derived, never stored: a job is exactly as far along as its parts."""
+        states = [w.state for w in self.workflows]
+        if all(s in TERMINAL for s in states):
+            if self.cancelled:
+                return CANCELLED
+            return FAILED if FAILED in states else DONE
+        if any(s != PENDING for s in states):
+            return RUNNING
+        return PENDING
+
+    @property
+    def terminal(self) -> bool:
+        return self.state in TERMINAL
+
+    def open_workflows(self) -> List[Workflow]:
+        """What still needs the card: pending, or running with a result unseen."""
+        return [w for w in self.workflows if w.state in (PENDING, RUNNING)]
+
+    def to_json(self, with_prompt: bool = False) -> Dict[str, Any]:
+        return {
+            "id": self.id, "model": self.model, "state": self.state,
+            "created": _iso(self.created), "started": _iso(self.started),
+            "finished": _iso(self.finished),
+            "workflows": [w.to_json(with_prompt) for w in self.workflows],
+        }
+
+
+class JobStore:
+    """Every job vramux knows about, persisted on each change."""
+
+    def __init__(self, path: Optional[Path] = None) -> None:
+        self._path = path
+        self._jobs: Dict[str, Job] = {}
+        self.handovers: List[Dict[str, Any]] = []
+        # Woken on every transition. A `?wait=1` caller sleeps on it rather
+        # than polling the store.
+        self._changed = asyncio.Event()
+        if path is not None:
+            self._load()
+
+    # ---- reading --------------------------------------------------------------
+
+    def get(self, job_id: str) -> Optional[Job]:
+        return self._jobs.get(job_id)
+
+    def all(self) -> List[Job]:
+        return sorted(self._jobs.values(), key=lambda j: j.created)
+
+    def open_jobs(self, model: Optional[str] = None) -> List[Job]:
+        """Jobs with work left, oldest first."""
+        return [
+            j for j in self.all()
+            if not j.terminal and (model is None or j.model == model)
+        ]
+
+    def next_workflow(self, model: str) -> Optional[tuple]:
+        """The next (job, workflow) to run on `model`: FIFO across jobs.
+
+        A running workflow comes before any pending one — it was submitted and
+        its result has not been seen, which after a restart is the first thing
+        to settle.
+        """
+        jobs = self.open_jobs(model)
+        for job in jobs:
+            for wf in job.workflows:
+                if wf.state == RUNNING:
+                    return job, wf
+        for job in jobs:
+            for wf in job.workflows:
+                if wf.state == PENDING:
+                    return job, wf
+        return None
+
+    def position(self, job: Job) -> int:
+        """Open jobs ahead of this one on the same model; 0 is next."""
+        ahead = 0
+        for other in self.open_jobs(job.model):
+            if other.id == job.id:
+                return ahead
+            ahead += 1
+        return 0
+
+    # ---- changing -------------------------------------------------------------
+
+    def submit(self, model: str, prompts: List[Dict[str, Any]]) -> Job:
+        job = Job(
+            id=uuid.uuid4().hex, model=model, created=time.time(),
+            workflows=[Workflow(index=i, prompt=p) for i, p in enumerate(prompts)],
+        )
+        self._jobs[job.id] = job
+        log.info("job %s: %d workflow(s) queued for %s", job.id, len(prompts), model)
+        self.changed()
+        return job
+
+    def cancel(self, job: Job) -> int:
+        """Cancel what has not started. A running prompt finishes; its result
+        is kept. Returns the number of workflows cancelled."""
+        n = 0
+        for wf in job.workflows:
+            if wf.state == PENDING:
+                wf.state = CANCELLED
+                n += 1
+        if n or not job.terminal:
+            job.cancelled = True
+        self._finish_if_done(job)
+        self.changed()
+        return n
+
+    def mark_running(self, job: Job, wf: Workflow) -> None:
+        wf.state = RUNNING
+        if job.started is None:
+            job.started = time.time()
+        self.changed()
+
+    def mark_done(self, job: Job, wf: Workflow, outputs: List[Dict[str, Any]]) -> None:
+        wf.state = DONE
+        wf.outputs = outputs
+        wf.error = None
+        self._finish_if_done(job)
+        self.changed()
+
+    def mark_failed(self, job: Job, wf: Workflow, error: str) -> None:
+        wf.state = FAILED
+        wf.error = error
+        self._finish_if_done(job)
+        self.changed()
+
+    def record_handover(self, row: Dict[str, Any]) -> None:
+        self.handovers.append(row)
+        del self.handovers[:-HANDOVER_KEEP]
+        self.changed()
+
+    def changed(self) -> None:
+        """Persist, and wake every waiter. Called after each transition."""
+        self._prune()
+        self._save()
+        event, self._changed = self._changed, asyncio.Event()
+        event.set()
+
+    async def wait_for_change(self, timeout: float) -> None:
+        try:
+            await asyncio.wait_for(self._changed.wait(), timeout=max(0.0, timeout))
+        except asyncio.TimeoutError:
+            pass
+
+    def _finish_if_done(self, job: Job) -> None:
+        if job.terminal and job.finished is None:
+            job.finished = time.time()
+            log.info("job %s %s", job.id, job.state)
+
+    def _prune(self) -> None:
+        now = time.time()
+        finished = sorted(
+            (j for j in self._jobs.values() if j.terminal),
+            key=lambda j: j.finished or j.created,
+        )
+        drop = [j for j in finished if now - (j.finished or j.created) > FINISHED_KEEP_S]
+        excess = len(finished) - len(drop) - FINISHED_KEEP_MAX
+        if excess > 0:
+            drop += [j for j in finished if j not in drop][:excess]
+        for job in drop:
+            del self._jobs[job.id]
+
+    # ---- persistence ----------------------------------------------------------
+
+    def _save(self) -> None:
+        """Same shape as the lease file's writer, plus an fsync: a job file
+        that is half-written after a power cut is a queue that is gone."""
+        if self._path is None:
+            return
+        rows = []
+        for job in self._jobs.values():
+            row = job.to_json(with_prompt=True)
+            row.update({
+                "created_wall": job.created, "started_wall": job.started,
+                "finished_wall": job.finished, "cancelled": job.cancelled,
+            })
+            rows.append(row)
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._path.with_suffix(".tmp")
+            with open(tmp, "w") as fh:
+                fh.write(json.dumps({"jobs": rows, "handovers": self.handovers}))
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self._path)
+        except OSError as exc:
+            log.warning("could not write job state to %s: %s", self._path, exc)
+
+    def _load(self) -> None:
+        """Take back the queue. Pending stays pending; a running workflow
+        keeps its prompt id, for the scheduler to look up once the workflow
+        server is up — it cannot be settled from here."""
+        try:
+            data = json.loads(self._path.read_text())
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as exc:
+            log.warning("ignoring unreadable job state %s: %s", self._path, exc)
+            return
+        for row in data.get("jobs") or []:
+            try:
+                job = Job(
+                    id=str(row["id"]), model=str(row["model"]),
+                    created=float(row["created_wall"]),
+                    started=row.get("started_wall"),
+                    finished=row.get("finished_wall"),
+                    cancelled=bool(row.get("cancelled")),
+                    workflows=[
+                        Workflow(
+                            index=int(w["index"]), prompt=dict(w["prompt"]),
+                            state=str(w["state"]), prompt_id=w.get("prompt_id"),
+                            outputs=list(w.get("outputs") or []),
+                            error=w.get("error"), attempts=int(w.get("attempts", 0)),
+                        )
+                        for w in row["workflows"]
+                    ],
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                log.warning("skipping a malformed job row in %s: %s", self._path, exc)
+                continue
+            self._jobs[job.id] = job
+            if not job.terminal:
+                log.info("restored job %s (%s), %d workflow(s) open",
+                         job.id, job.state, len(job.open_workflows()))
+        self.handovers = list(data.get("handovers") or [])[-HANDOVER_KEEP:]
