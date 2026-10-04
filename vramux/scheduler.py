@@ -64,6 +64,11 @@ _HISTORY_POLL = 1.0
 # How often an open window re-reads the stack's queue and history.
 _WINDOW_POLL = 2.0
 
+# A window held for N prompts also closes once the stack's queue has sat
+# empty this long: the human it was opened for has walked away, and the
+# language models parked behind it are not to wait for them to come back.
+WINDOW_IDLE = 600.0
+
 # How often the to_llm handover is sampled, and how long after a flip-back a
 # following language-model load still counts as that handover.
 _HANDOVER_POLL = 0.2
@@ -317,6 +322,10 @@ class Scheduler:
 
     async def _render(self, spec: ModelSpec, trigger: str) -> None:
         pending = self._pending_workflows(spec.tag)
+        # The drain runs what was pending when the flip was decided, and no
+        # more: a steady trickle of submits must not hold the language models
+        # off the card for ever. What arrives meanwhile waits for the next flip.
+        batch = self.store.open_keys(spec.tag)
         decided = time.monotonic()
         self.mode, self.render_model = RENDER, spec.tag
         self.arbiter.hold_render(spec.tag)
@@ -345,7 +354,7 @@ class Scheduler:
                        timings.get("load_s", 0.0), pending, trigger)
         reason = "drained"
         try:
-            reason = await self._drain(spec)
+            reason = await self._drain(spec, batch)
         except _Lost as exc:
             reason = f"lost the stack: {exc}"
             self._failed()
@@ -372,8 +381,18 @@ class Scheduler:
         log.error("job %s: %s failed to start %d times in a row — failing its %d "
                   "open workflow(s)", head.id, spec.tag, starts, failed)
 
-    async def _drain(self, spec: ModelSpec) -> str:
+    async def _drain(self, spec: ModelSpec, batch: set) -> str:
+        try:
+            reason = await self._drain_batch(spec, batch)
+        finally:
+            deferred = len(self.store.open_keys(spec.tag) - batch)
+            if deferred:
+                log.info("%d workflow(s) submitted during it wait for the next flip", deferred)
+        return reason
+
+    async def _drain_batch(self, spec: ModelSpec, batch: set) -> str:
         base = self.arbiter.upstream_for(spec.tag)
+        ran = 0
         while True:
             if spec.tag not in {r.tag for r in self.arbiter.residents}:
                 raise _Lost(f"{spec.tag} is no longer resident")
@@ -382,9 +401,15 @@ class Scheduler:
                 # Counted from when the window met the stack, so prompts that
                 # finished before it opened are not counted towards it.
                 await self._window_baseline(base)
+            if window is not None:
+                # The card is held for the window anyway: jobs that arrive
+                # during it run during it, rather than flipping again after.
+                batch |= self.store.open_keys(spec.tag)
             bound = spec.llm_latency_bound
             parked = self.arbiter.parked
-            if window is None and bound is not None and parked:
+            # Not before one workflow has run: a flip that took longer than
+            # the bound would otherwise be paid for and thrown away.
+            if window is None and bound is not None and parked and ran:
                 waited = time.monotonic() - parked[0][1]
                 if waited >= bound:
                     # The latency bound is checked between workflows only: a
@@ -394,11 +419,20 @@ class Scheduler:
                              "flipping back with %d workflow(s) still pending",
                              parked[0][0], waited, bound, self._pending_workflows(spec.tag))
                     return "llm latency bound"
-            nxt = self.store.next_workflow(spec.tag)
+            nxt = self.store.next_workflow(spec.tag, only=batch)
             if nxt is not None:
                 await self._run_charged(spec, base, *nxt)
+                ran += 1
                 continue
             if window is None:
+                if not ran:
+                    # Flipped for work there turned out to be none of — the
+                    # same flip would be chosen again at once, in a loop that
+                    # never yields. Back off as for a failure.
+                    wait = self._failed()
+                    log.warning("render on %s ran nothing; not flipping again for %.0fs",
+                                spec.tag, wait)
+                    return "nothing to run"
                 return "drained"
             if await self._window_done(base, window):
                 self.window = None
@@ -558,19 +592,26 @@ class Scheduler:
         window["baseline"] = len(history) if isinstance(history, dict) else 0
 
     async def _window_done(self, base: str, window: Dict[str, Any]) -> bool:
-        if window["jobs"] is not None:
-            history = await self._get_json(f"{base}/history")
-            count = len(history) if isinstance(history, dict) else 0
-            window["done"] = max(0, count - (window["baseline"] or 0))
-            return window["done"] >= window["jobs"]
         depth = await http_queue_depth(base, "/queue")
         now = time.monotonic()
         if depth:
             window["queue_empty_since"] = None
-            return False
-        if window["queue_empty_since"] is None:
+        elif window["queue_empty_since"] is None:
             window["queue_empty_since"] = now
-        return now - window["queue_empty_since"] >= window["minutes"] * 60.0
+        idle = 0.0 if depth else now - window["queue_empty_since"]
+        if window["jobs"] is not None:
+            history = await self._get_json(f"{base}/history")
+            count = len(history) if isinstance(history, dict) else 0
+            window["done"] = max(0, count - (window["baseline"] or 0))
+            if window["done"] >= window["jobs"]:
+                return True
+            if idle >= WINDOW_IDLE:
+                log.info("render window on %s: queue empty %.0fs with %d of %d prompt(s) "
+                         "done — closing it", window["model"], idle,
+                         window["done"], window["jobs"])
+                return True
+            return False
+        return idle >= window["minutes"] * 60.0
 
     # ---- handovers ------------------------------------------------------------
 

@@ -86,7 +86,9 @@ not defended.
   queues a batch and answers `202 {id, state, position}` at once. A scheduler
   holds the jobs while language models work, flips to render when a trigger
   fires, runs every pending workflow one at a time under that one flip, and
-  flips back; chat requests that arrive meanwhile park behind it. Triggers,
+  flips back; chat requests that arrive meanwhile park behind it. A flip runs
+  the workflows pending when it was decided; jobs submitted during it wait
+  for the next one. Triggers,
   typed per entry, each off unless set:
   - `render_start_deadline: S` — the oldest pending job has waited S seconds
   - `render_batch_trigger: N` — N jobs are pending
@@ -98,7 +100,12 @@ not defended.
   with a `/view` URL; `DELETE /gpu/jobs/{id}` cancels what has not started.
   `POST /gpu/jobs/window {model, jobs: N | minutes: T}` holds render mode for
   somebody at the stack's own UI until N prompts complete or its queue sits
-  empty T minutes; `DELETE /gpu/jobs/window` ends it. Jobs survive a restart
+  empty T minutes; `DELETE /gpu/jobs/window` ends it. A window by N also
+  closes once the queue has sat empty for 600 s (`WINDOW_IDLE`), so a human
+  who walks away does not park the language models for good. Prompts vramux
+  submitted do not count toward N. `llm_latency_bound` does not apply inside a
+  window — somebody asked for the hold — and jobs submitted during a window
+  run in it. Jobs survive a restart
   (`vramux/jobs.json` under the XDG state dir, or `VRAMUX_JOBS_FILE`); each handover
   is timed both ways, logged, and shown by `vramux top`
 

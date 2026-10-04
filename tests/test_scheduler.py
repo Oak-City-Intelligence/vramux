@@ -554,3 +554,48 @@ async def test_an_exception_in_a_workflow_charges_an_attempt(rig, monkeypatch):
     wf = job.workflows[0]
     assert wf.state == FAILED and wf.attempts == 2
     assert "cannot read these outputs" in wf.error
+
+
+# ---- a bounded drain ----------------------------------------------------------
+
+
+async def test_a_job_submitted_mid_render_waits_for_the_next_flip(rig, monkeypatch, caplog):
+    fake, build = rig
+    monkeypatch.setattr(sched_mod, "QUIET_GRACE", 0.0)
+    _arbiter, _stack, store, sch = build()
+    fake.gate = asyncio.Event()
+    first = store.submit(STACK, [{"a": {}}])
+    sch.start()
+    await until(lambda: fake.prompts)
+    late = store.submit(STACK, [{"b": {}}])
+    with caplog.at_level("INFO", logger="vramux.scheduler"):
+        fake.gate.set()
+        await until(lambda: late.terminal)
+    assert first.state == DONE and late.state == DONE
+    assert [h["dir"] for h in store.handovers].count("to_render") == 2, \
+        "the late job ran under a flip of its own"
+    assert "1 workflow(s) submitted during it wait for the next flip" in caplog.text
+
+
+async def test_a_count_window_closes_when_its_human_walks_away(rig, monkeypatch):
+    _fake, build = rig
+    monkeypatch.setattr(sched_mod, "WINDOW_IDLE", 0.2)
+    arbiter, stack, _store, sch = build()
+    sch.start()
+    sch.open_window(stack, jobs=5, minutes=None)
+    await until(lambda: sch.mode == RENDER)
+    await until(lambda: sch.mode == LLM, timeout=2.0)
+    assert sch.window is None
+
+
+async def test_a_drain_that_runs_nothing_backs_off(rig, monkeypatch):
+    _fake, build = rig
+    monkeypatch.setattr(sched_mod, "QUIET_GRACE", 0.0)
+    monkeypatch.setattr(sched_mod, "_FLIP_RETRY", 5.0)
+    _arbiter, _stack, store, sch = build()
+    store.submit(STACK, [{"a": {}}])
+    monkeypatch.setattr(store, "next_workflow", lambda *a, **k: None)
+    sch.start()
+    await asyncio.sleep(0.3)
+    flips = [h["dir"] for h in store.handovers].count("to_render")
+    assert flips == 1, f"{flips} flips in 0.3s: a hot loop"

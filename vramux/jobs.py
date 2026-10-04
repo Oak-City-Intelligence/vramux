@@ -224,23 +224,24 @@ class JobStore:
             if not j.terminal and (model is None or j.model == model)
         ]
 
-    def next_workflow(self, model: str) -> Optional[tuple]:
+    def next_workflow(self, model: str, only: Optional[set] = None) -> Optional[tuple]:
         """The next (job, workflow) to run on `model`: FIFO across jobs.
 
         A running workflow comes before any pending one — it was submitted and
         its result has not been seen, which after a restart is the first thing
-        to settle.
+        to settle. `only`, a set of (job id, index), limits the choice to it.
         """
         jobs = self.open_jobs(model)
-        for job in jobs:
-            for wf in job.workflows:
-                if wf.state == RUNNING:
-                    return job, wf
-        for job in jobs:
-            for wf in job.workflows:
-                if wf.state == PENDING:
-                    return job, wf
+        for state in (RUNNING, PENDING):
+            for job in jobs:
+                for wf in job.workflows:
+                    if wf.state == state and (only is None or (job.id, wf.index) in only):
+                        return job, wf
         return None
+
+    def open_keys(self, model: str) -> set:
+        """(job id, index) of every workflow on `model` that still needs the card."""
+        return {(j.id, w.index) for j in self.open_jobs(model) for w in j.open_workflows()}
 
     def position(self, job: Job) -> int:
         """Open jobs ahead of this one on the same model; 0 is next."""
