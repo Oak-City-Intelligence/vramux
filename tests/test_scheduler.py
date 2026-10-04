@@ -599,3 +599,22 @@ async def test_a_drain_that_runs_nothing_backs_off(rig, monkeypatch):
     await asyncio.sleep(0.3)
     flips = [h["dir"] for h in store.handovers].count("to_render")
     assert flips == 1, f"{flips} flips in 0.3s: a hot loop"
+
+
+async def test_a_count_window_counts_only_the_humans_prompts(rig):
+    fake, build = rig
+    arbiter, stack, store, sch = build()
+    await llm_resident(arbiter, hold=True)       # only the window flips
+    sch.start()
+    sch.open_window(stack, jobs=2, minutes=None)
+    await until(lambda: sch.mode == RENDER and sch.window["baseline"] is not None)
+    ours = store.submit(STACK, [{"a": {}}, {"b": {}}])
+    sch.wake()
+    await until(lambda: ours.terminal)
+    fake.complete("human-1")
+    await asyncio.sleep(0.1)
+    assert sch.mode == RENDER, "vramux's own prompts are not the human's"
+    fake.history.clear()                          # the stack's history was cleared
+    await asyncio.sleep(0.1)
+    fake.complete("human-2")
+    await until(lambda: sch.mode == LLM)

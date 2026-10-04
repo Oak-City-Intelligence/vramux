@@ -185,6 +185,9 @@ class Scheduler:
         # Consecutive failed flips (backoff), and of those the failed starts.
         self._failures = 0
         self._failed_starts = 0
+        # Every prompt id this process submitted, so a window counting a
+        # human's prompts does not count vramux's own.
+        self._submitted: set = set()
 
     # ---- lifecycle ------------------------------------------------------------
 
@@ -229,7 +232,7 @@ class Scheduler:
     def open_window(self, spec: ModelSpec, jobs: Optional[int], minutes: Optional[float]) -> Dict:
         self.window = {
             "model": spec.tag, "jobs": jobs, "minutes": minutes,
-            "opened": time.time(), "baseline": None, "done": 0,
+            "opened": time.time(), "baseline": None, "counted": set(), "done": 0,
             "queue_empty_since": None,
         }
         log.info("render window opened on %s: %s", spec.tag,
@@ -516,6 +519,7 @@ class Scheduler:
             self.store.mark_failed(job, wf, text)
             return
         wf.prompt_id = str(body["prompt_id"])
+        self._submitted.add(wf.prompt_id)
         self.store.changed()
         log.info("job %s workflow %d submitted to %s as %s",
                  job.id, wf.index, spec.tag, wf.prompt_id)
@@ -589,7 +593,7 @@ class Scheduler:
         if window is None or window["baseline"] is not None:
             return
         history = await self._get_json(f"{base}/history")
-        window["baseline"] = len(history) if isinstance(history, dict) else 0
+        window["baseline"] = set(history) if isinstance(history, dict) else set()
 
     async def _window_done(self, base: str, window: Dict[str, Any]) -> bool:
         depth = await http_queue_depth(base, "/queue")
@@ -601,8 +605,16 @@ class Scheduler:
         idle = 0.0 if depth else now - window["queue_empty_since"]
         if window["jobs"] is not None:
             history = await self._get_json(f"{base}/history")
-            count = len(history) if isinstance(history, dict) else 0
-            window["done"] = max(0, count - (window["baseline"] or 0))
+            present = set(history) if isinstance(history, dict) else set()
+            # Rebased on what is still there: a history that shrank (cleared
+            # by hand, trimmed by the stack) must not leave the count waiting
+            # for entries that no longer exist.
+            window["baseline"] &= present
+            ours = self._submitted | {
+                w.prompt_id for j in self.store.all() for w in j.workflows if w.prompt_id
+            }
+            window["counted"] |= present - window["baseline"] - ours
+            window["done"] = len(window["counted"])
             if window["done"] >= window["jobs"]:
                 return True
             if idle >= WINDOW_IDLE:
