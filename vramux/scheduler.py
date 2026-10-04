@@ -175,14 +175,17 @@ class Scheduler:
             self._task = asyncio.create_task(self._run())
 
     async def close(self) -> None:
-        for task in (self._task, self._watch):
+        # The main task first: cancelled mid-render it releases the card and
+        # starts a handover watch on the way out, which is then cancelled too.
+        for name in ("_task", "_watch"):
+            task = getattr(self, name)
+            setattr(self, name, None)
             if task is not None:
                 task.cancel()
                 try:
                     await task
                 except (asyncio.CancelledError, Exception):
                     pass
-        self._task = self._watch = None
         if self._session is not None:
             await self._session.close()
             self._session = None
@@ -298,11 +301,15 @@ class Scheduler:
         timings: Dict[str, float] = {}
         try:
             await self.arbiter.acquire(spec, scheduled=True, timings=timings)
-        except Exception as exc:
-            log.warning("could not flip to render for %s: %s — retrying in %.0fs",
-                        spec.tag, exc, _FLIP_RETRY)
+        except BaseException as exc:
+            # Cancellation included: a hold left behind parks every chat
+            # request until the process exits.
             self.arbiter.release_render()
             self.mode, self.render_model = LLM, None
+            if not isinstance(exc, Exception):
+                raise
+            log.warning("could not flip to render for %s: %s — retrying in %.0fs",
+                        spec.tag, exc, _FLIP_RETRY)
             self._not_before = time.monotonic() + _FLIP_RETRY
             return
         total = time.monotonic() - decided

@@ -445,3 +445,29 @@ async def test_closing_a_window_by_hand_flips_back(rig):
         await until(lambda: sch.mode == LLM)
         resp = await client.post("/gpu/jobs/window", json={"model": STACK, "jobs": 1, "minutes": 1})
         assert resp.status == 400
+
+
+async def test_a_stack_that_will_not_start_releases_the_hold(rig, monkeypatch):
+    _fake, build = rig
+    monkeypatch.setattr(sched_mod, "QUIET_GRACE", 0.0)
+    arbiter, _stack, store, sch = build()
+    arbiter.fail_next_start = True
+    store.submit(STACK, [{"a": {}}])
+    sch.start()
+    await until(lambda: "start-failed:stack:1" in arbiter.events)
+    arbiter.fail_next_start = False     # QueueArbiter does not reset it itself
+    await until(lambda: sch.mode == LLM and arbiter.render_hold is None)
+    await asyncio.wait_for(arbiter.acquire(spec("llm:27b")), 1.0)
+    arbiter.release("llm:27b")
+
+
+async def test_closing_mid_render_leaves_no_hold(rig, monkeypatch):
+    fake, build = rig
+    monkeypatch.setattr(sched_mod, "QUIET_GRACE", 0.0)
+    arbiter, _stack, store, sch = build()
+    fake.gate = asyncio.Event()
+    store.submit(STACK, [{"a": {}}])
+    sch.start()
+    await until(lambda: fake.prompts)
+    await sch.close()
+    assert arbiter.render_hold is None and sch._watch is None
