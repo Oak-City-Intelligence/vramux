@@ -217,3 +217,66 @@ def test_tag_entry_reports_size_and_format_per_kind(isolated_registry, tmp_path)
 def test_size_is_zero_when_weights_are_absent():
     assert ModelSpec(tag="x", gguf_path=Path("/nonexistent/x.gguf")).size_bytes == 0
     assert ModelSpec(tag="x").size_bytes == 0
+
+
+# ---- render-job fields ----------------------------------------------------
+
+
+def _stack(tmp_path, **fields):
+    return {
+        "kind": "docker", "compose_file": str(tmp_path / "c.yml"),
+        "port": 8188, "exclusive": True, **fields,
+    }
+
+
+def test_render_job_fields_are_typed(isolated_registry, tmp_path):
+    cfg = write_yaml(tmp_path / "models.yml", {"img:1": _stack(
+        tmp_path, jobs="comfy", render_start_deadline=300,
+        render_batch_trigger=3, llm_latency_bound=45.5,
+    )})
+    s = ModelRegistry(config_file=cfg, model_dir=tmp_path / "nope").get("img:1")
+    assert s.jobs == "comfy"
+    assert s.render_start_deadline == 300.0 and isinstance(s.render_start_deadline, float)
+    assert s.render_batch_trigger == 3 and isinstance(s.render_batch_trigger, int)
+    assert s.llm_latency_bound == 45.5
+
+
+def test_render_bounds_default_to_off(isolated_registry, tmp_path):
+    cfg = write_yaml(tmp_path / "models.yml", {"img:1": _stack(tmp_path, jobs="comfy")})
+    s = ModelRegistry(config_file=cfg, model_dir=tmp_path / "nope").get("img:1")
+    assert (s.render_start_deadline, s.render_batch_trigger, s.llm_latency_bound) == (
+        None, None, None,
+    )
+
+
+@pytest.mark.parametrize("fields, needle", [
+    ({"jobs": "comfy", "render_start_deadline": "soon"}, "render_start_deadline must be a number"),
+    ({"jobs": "comfy", "render_start_deadline": -1}, "render_start_deadline must be at least 0"),
+    ({"jobs": "comfy", "render_batch_trigger": 0}, "render_batch_trigger must be at least 1"),
+    ({"jobs": "comfy", "render_batch_trigger": 2.5}, "render_batch_trigger must be a whole number"),
+    ({"jobs": "comfy", "llm_latency_bound": True}, "llm_latency_bound must be a number"),
+    ({"jobs": "a1111"}, "jobs must be one of comfy"),
+    ({"render_batch_trigger": 3}, "render_batch_trigger is set but jobs is not"),
+])
+def test_a_bad_render_field_rejects_the_model_by_name(
+    isolated_registry, tmp_path, caplog, fields, needle,
+):
+    cfg = write_yaml(tmp_path / "models.yml", {
+        "img:1": _stack(tmp_path, **fields),
+        "other:1": _stack(tmp_path),
+    })
+    with caplog.at_level("ERROR", logger="vramux.registry"):
+        reg = ModelRegistry(config_file=cfg, model_dir=tmp_path / "nope")
+    assert reg.get("img:1") is None, "a bad field refuses the entry, it is not ignored"
+    assert reg.get("other:1") is not None
+    [record] = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert record.getMessage().startswith("img:1: ") and needle in record.getMessage()
+
+
+def test_jobs_on_a_llama_server_entry_is_refused(isolated_registry, tmp_path, caplog):
+    blob = gguf(tmp_path / "m", "a.gguf")
+    cfg = write_yaml(tmp_path / "models.yml", {"a:1": {"gguf": str(blob), "jobs": "comfy"}})
+    with caplog.at_level("ERROR", logger="vramux.registry"):
+        reg = ModelRegistry(config_file=cfg, model_dir=tmp_path / "nope")
+    assert reg.get("a:1") is None
+    assert "a:1: jobs needs a docker-kind entry" in caplog.text

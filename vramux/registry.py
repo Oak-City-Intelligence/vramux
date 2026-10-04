@@ -166,6 +166,21 @@ class ModelSpec:
     # the job it was about to receive. None = displaceable the moment its
     # queue reads empty, as before.
     lend_after: Optional[float] = None
+    # --- render jobs (see `scheduler.py`) -------------------------------------
+    # `jobs: comfy` makes this model take batches of workflows on
+    # `/gpu/jobs`, run by the scheduler that hands it the whole card in time
+    # slices. The three bounds are the operator's numbers to type, and None
+    # means that trigger is off — there is deliberately no default for any.
+    jobs: Optional[str] = None
+    # Flip the card to render once the oldest pending job is this many seconds
+    # old, whatever the language models are doing.
+    render_start_deadline: Optional[float] = None
+    # Flip once this many jobs are pending.
+    render_batch_trigger: Optional[int] = None
+    # Once a language-model request has waited this long behind render mode,
+    # submit no more workflows: flip back after the one running. None =
+    # drain the queue fully before flipping back.
+    llm_latency_bound: Optional[float] = None
     # Directory of weights, for size reporting only (docker kind has no single
     # blob to stat).
     weights_dir: Optional[Path] = None
@@ -297,6 +312,59 @@ def _scan_model_dir(root: Path) -> Dict[str, ModelSpec]:
     return specs
 
 
+# The job API kinds that exist. One today: a workflow server's /prompt and
+# /history.
+JOB_KINDS = ("comfy",)
+
+
+def _job_fields(tag: str, entry: Dict) -> Optional[Dict]:
+    """The render-job fields of one config entry, typed, or None if any is bad.
+
+    A wrong type here is not a field to ignore: a deadline that silently
+    reads as "off" is a queue that never flips, and nobody finds out until a
+    job has sat for a day. So the entry is refused, naming the model and the
+    field, in one line. Only these fields — the rest of the loader keeps its
+    own conversions.
+    """
+    out: Dict = {}
+
+    def bad(field_name: str, why: str) -> None:
+        log.error("%s: %s %s — entry skipped", tag, field_name, why)
+
+    jobs = entry.get("jobs")
+    if jobs is not None:
+        if jobs not in JOB_KINDS:
+            bad("jobs", f"must be one of {', '.join(JOB_KINDS)}, got {jobs!r}")
+            return None
+        if entry.get("kind", KIND_LLAMA_SERVER) != KIND_DOCKER:
+            bad("jobs", "needs a docker-kind entry (the workflow server)")
+            return None
+        out["jobs"] = jobs
+    for name, typ, floor in (
+        ("render_start_deadline", float, 0),
+        ("render_batch_trigger", int, 1),
+        ("llm_latency_bound", float, 0),
+    ):
+        value = entry.get(name)
+        if value is None:
+            continue
+        if jobs is None:
+            bad(name, "is set but jobs is not")
+            return None
+        # bool is an int to Python and `true` is not a number of seconds.
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            bad(name, f"must be a number, got {value!r}")
+            return None
+        if typ is int and value != int(value):
+            bad(name, f"must be a whole number, got {value!r}")
+            return None
+        if value < floor:
+            bad(name, f"must be at least {floor}, got {value!r}")
+            return None
+        out[name] = typ(value)
+    return out
+
+
 class ModelRegistry:
     """Loads model specs from YAML config, with discovery from a model dir
     and a final fallback to ollama-blob manifests."""
@@ -333,6 +401,9 @@ class ModelRegistry:
                     spec.ctx_size = int(ctx)
             for tag, entry in (data.get("models") or {}).items():
                 kind = entry.get("kind", KIND_LLAMA_SERVER)
+                job_fields = _job_fields(tag, entry)
+                if job_fields is None:
+                    continue
                 if kind == KIND_DOCKER:
                     specs[tag] = ModelSpec(
                         tag=tag,
@@ -353,6 +424,7 @@ class ModelRegistry:
                         vram_mb=(int(entry["vram_mb"]) if entry.get("vram_mb") is not None else None),
                         exclusive=bool(entry.get("exclusive", False)),
                         priority=(int(entry["priority"]) if entry.get("priority") is not None else None),
+                        **job_fields,
                     )
                     continue
                 gguf = Path(entry["gguf"]).expanduser()

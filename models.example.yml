@@ -115,6 +115,17 @@ models:
   # idle seconds and the image stack is started back up. `lend_after` keeps it
   # until its queue has sat empty that long, so whoever loaded it can queue a
   # job before a waiting request takes the card back.
+  # `jobs: comfy` turns on the job API (POST /gpu/jobs): batches of
+  # workflows queue without blocking, and a scheduler hands the stack the whole
+  # card in time slices — it holds the jobs while language models work, flips
+  # to render on a trigger, runs every pending workflow under that one flip,
+  # and flips back. The triggers are yours to type; each one left out is off:
+  #   render_start_deadline: seconds the oldest pending job may wait
+  #   render_batch_trigger:  number of pending jobs that flips at once
+  #   llm_latency_bound:     seconds a chat request may wait behind render
+  #                          before the drain stops after the running workflow
+  # With none set, jobs run whenever no language-model request has arrived
+  # for a few seconds.
   # No vram_mb: the container starts near-empty and grows per workflow.
   #imagestack:1:
   #  kind: docker
@@ -125,6 +136,10 @@ models:
   #  busy_path: /queue
   #  restore_after: 120
   #  lend_after: 90
+  #  jobs: comfy
+  #  render_start_deadline:   # seconds; empty = off
+  #  render_batch_trigger:    # jobs; empty = off
+  #  llm_latency_bound:       # seconds; empty = off
   #  exclusive: true
   #  idle_timeout: 0
   #  family: imagestack
