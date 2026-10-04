@@ -70,8 +70,21 @@ _HANDOVER_POLL = 0.2
 _HANDOVER_WATCH = 900.0
 
 # After a flip that failed, or a stack that went away mid-drain, how long
-# before trying again. Without it a broken stack is a hot loop of loads.
+# before trying again: doubling from `_FLIP_RETRY` per consecutive failure up
+# to `_FLIP_RETRY_MAX`, reset by a flip that works. Without it a broken stack
+# is a loop of loads, each one evicting the language models for nothing.
 _FLIP_RETRY = 30.0
+_FLIP_RETRY_MAX = 900.0
+
+# Consecutive failed starts of the stack before the job at the head of its
+# queue is failed instead of retried. A job whose stack cannot come up must
+# not hold the card's language models hostage for ever.
+_STARTS_PER_JOB = 3
+
+
+def retry_after(failures: int) -> float:
+    """Seconds to wait after `failures` consecutive failed flips."""
+    return min(_FLIP_RETRY * 2 ** max(0, failures - 1), _FLIP_RETRY_MAX)
 
 # A prompt absent from both history and queue this many reads in a row is
 # gone, not between the two: the server moves a finished prompt from one to
@@ -164,6 +177,9 @@ class Scheduler:
         # flip-back — without it the deadline, already past, flips straight
         # back and the bound buys nothing.
         self._not_before = 0.0
+        # Consecutive failed flips (backoff), and of those the failed starts.
+        self._failures = 0
+        self._failed_starts = 0
 
     # ---- lifecycle ------------------------------------------------------------
 
@@ -283,9 +299,16 @@ class Scheduler:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.exception("scheduler step failed; retrying in %.0fs", _FLIP_RETRY)
-                self._not_before = time.monotonic() + _FLIP_RETRY
+                log.exception("scheduler step failed")
+                self._failed()
                 await asyncio.sleep(_TICK)
+
+    def _failed(self) -> float:
+        """Count a failed flip and back off for it. Returns the wait."""
+        self._failures += 1
+        wait = retry_after(self._failures)
+        self._not_before = time.monotonic() + wait
+        return wait
 
     # ---- render mode ----------------------------------------------------------
 
@@ -309,10 +332,14 @@ class Scheduler:
             self.mode, self.render_model = LLM, None
             if not isinstance(exc, Exception):
                 raise
-            log.warning("could not flip to render for %s: %s — retrying in %.0fs",
-                        spec.tag, exc, _FLIP_RETRY)
-            self._not_before = time.monotonic() + _FLIP_RETRY
+            wait = self._failed()
+            self._failed_starts += 1
+            log.warning("could not flip to render for %s (failure %d in a row): %s "
+                        "— retrying in %.0fs", spec.tag, self._failures, exc, wait)
+            if self._failed_starts % _STARTS_PER_JOB == 0:
+                self._fail_head_job(spec, self._failed_starts)
             return
+        self._failures = self._failed_starts = 0
         total = time.monotonic() - decided
         self._handover("to_render", total, timings.get("evict_s", 0.0),
                        timings.get("load_s", 0.0), pending, trigger)
@@ -321,7 +348,7 @@ class Scheduler:
             reason = await self._drain(spec)
         except _Lost as exc:
             reason = f"lost the stack: {exc}"
-            self._not_before = time.monotonic() + _FLIP_RETRY
+            self._failed()
         finally:
             released = time.monotonic()
             parked = len(self.arbiter.parked)
@@ -331,6 +358,19 @@ class Scheduler:
             log.info("render over on %s (%s); %d request(s) were parked",
                      spec.tag, reason, parked)
             self._watch = asyncio.create_task(self._time_to_llm(spec.tag, released, parked))
+
+    def _fail_head_job(self, spec: ModelSpec, starts: int) -> None:
+        open_jobs = self.store.open_jobs(spec.tag)
+        if not open_jobs:
+            return
+        head = open_jobs[0]
+        reason = f"stack failed to start {starts} times"
+        failed = 0
+        for wf in head.open_workflows():
+            self.store.mark_failed(head, wf, reason)
+            failed += 1
+        log.error("job %s: %s failed to start %d times in a row — failing its %d "
+                  "open workflow(s)", head.id, spec.tag, starts, failed)
 
     async def _drain(self, spec: ModelSpec) -> str:
         base = self.arbiter.upstream_for(spec.tag)
@@ -356,7 +396,7 @@ class Scheduler:
                     return "llm latency bound"
             nxt = self.store.next_workflow(spec.tag)
             if nxt is not None:
-                await self._run_workflow(spec, base, *nxt)
+                await self._run_charged(spec, base, *nxt)
                 continue
             if window is None:
                 return "drained"
@@ -371,6 +411,25 @@ class Scheduler:
                 pass
 
     # ---- one workflow ---------------------------------------------------------
+
+    async def _run_charged(self, spec: ModelSpec, base: str, job: Job, wf: Workflow) -> None:
+        """Run one workflow; any failure that is not the stack going away
+        costs it an attempt, so a workflow that breaks the scheduler every
+        time it is looked at ends failed, not retried for ever."""
+        before = wf.attempts
+        try:
+            await self._run_workflow(spec, base, job, wf)
+        except (_Lost, asyncio.CancelledError):
+            raise
+        except Exception as exc:
+            if wf.attempts == before:
+                wf.attempts += 1
+            log.exception("job %s workflow %d raised (attempt %d of %d)",
+                          job.id, wf.index, wf.attempts, MAX_ATTEMPTS)
+            if wf.attempts >= MAX_ATTEMPTS:
+                self.store.mark_failed(job, wf, f"{type(exc).__name__}: {exc}")
+            else:
+                self.store.changed()
 
     async def _run_workflow(self, spec: ModelSpec, base: str, job: Job, wf: Workflow) -> None:
         if wf.state == RUNNING and wf.prompt_id:

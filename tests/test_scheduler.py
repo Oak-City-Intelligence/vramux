@@ -507,3 +507,50 @@ async def test_a_malformed_body_is_400_not_500(rig, path, body):
     async with TestClient(TestServer(app)) as client:
         resp = await client.post(path, json=body)
         assert resp.status == 400
+
+
+# ---- failures ---------------------------------------------------------------
+
+
+def test_failed_flips_back_off_exponentially_to_a_cap(monkeypatch):
+    monkeypatch.setattr(sched_mod, "_FLIP_RETRY", 30.0)   # the shipped base
+    assert [sched_mod.retry_after(n) for n in range(1, 8)] == [
+        30.0, 60.0, 120.0, 240.0, 480.0, 900.0, 900.0]
+
+
+async def test_a_stack_that_keeps_failing_fails_the_head_job(rig, monkeypatch):
+    _fake, build = rig
+    monkeypatch.setattr(sched_mod, "QUIET_GRACE", 0.0)
+    monkeypatch.setattr(sched_mod, "_FLIP_RETRY", 0.01)
+    arbiter, _stack, store, sch = build()
+    arbiter.fail_next_start = True               # sticks: every start fails
+    head = store.submit(STACK, [{"a": {}}, {"b": {}}])
+    second = store.submit(STACK, [{"c": {}}])
+    sch.start()
+    await until(lambda: head.terminal)
+    assert arbiter.events.count("start-failed:stack:1") == 3
+    assert {w.error for w in head.workflows} == {"stack failed to start 3 times"}
+    assert second.state == PENDING, "only the head job is failed"
+    gap = sch._not_before - time.monotonic()
+    assert 0.03 < gap <= 0.04 + 0.01, "the third failure backs off 4x the base"
+
+    arbiter.fail_next_start = False
+    await until(lambda: second.terminal)
+    assert sch._failures == 0, "a successful flip resets the backoff"
+
+
+async def test_an_exception_in_a_workflow_charges_an_attempt(rig, monkeypatch):
+    _fake, build = rig
+    monkeypatch.setattr(sched_mod, "QUIET_GRACE", 0.0)
+
+    def broken(entry, tag):
+        raise RuntimeError("cannot read these outputs")
+
+    monkeypatch.setattr(sched_mod, "outputs_of", broken)
+    _arbiter, _stack, store, sch = build()
+    job = store.submit(STACK, [{"a": {}}])
+    sch.start()
+    await until(lambda: job.terminal)
+    wf = job.workflows[0]
+    assert wf.state == FAILED and wf.attempts == 2
+    assert "cannot read these outputs" in wf.error
