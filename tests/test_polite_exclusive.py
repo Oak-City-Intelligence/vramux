@@ -177,3 +177,22 @@ async def test_without_lend_after_an_idle_stack_is_lent_at_once():
     sup.release("stack:1")
     await asyncio.wait_for(sup.acquire(llm), 0.5)
     assert sup.current_tag == "llm:27b"
+
+
+async def test_the_wait_is_labelled_by_what_it_is_actually_waiting_on():
+    """Every request queued on the lock reads the holder's label. It used to
+    say "running job(s)" through a lend_after window while the holder's own
+    line said "0 job(s)", so the same wait was logged two contradictory ways."""
+    sup = QueueArbiter(drain_timeout=0.2, startup_timeout=5.0, busy_wait=5.0)
+    img, llm = stack(lend_after=0.3), spec("llm:27b")
+    await sup.acquire(img)
+    sup.release("stack:1")
+
+    load = asyncio.create_task(sup.acquire(llm))
+    await asyncio.sleep(0.05)
+    assert "lend_after window" in sup.loading["behind"]
+    sup.jobs["stack:1"] = 2
+    await asyncio.sleep(0.05)
+    assert sup.loading["behind"] == "stack:1's 2 running job(s)"
+    sup.jobs["stack:1"] = 0
+    await asyncio.wait_for(load, 2)

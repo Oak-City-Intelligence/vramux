@@ -772,9 +772,9 @@ class ResidencyArbiter:
             return
         started = time.monotonic()
         previous = self._loading
-        behind = f"{resident.tag}'s running job(s)"
         self._loading = Loading(
-            tag=incoming.tag, started=started, budget=self.busy_wait, behind=behind,
+            tag=incoming.tag, started=started, budget=self.busy_wait,
+            behind=self._busy_label(resident, jobs, settling),
         )
         if jobs > 0:
             log.info(
@@ -798,16 +798,28 @@ class ResidencyArbiter:
                     )
                 if now - last_log >= _WAIT_LOG_INTERVAL:
                     last_log = now
-                    log.info("waiting: %s behind %d job(s) on %s", incoming.tag, jobs, resident.tag)
+                    log.info("waiting: %s behind %s", incoming.tag, self._loading.behind)
                 await asyncio.sleep(_BUSY_POLL)
                 jobs = await self._busy_jobs(resident)
                 settling = self._settling(resident)
+                # One label for both reporters. Hard-coded to "running job(s)"
+                # it read that way to every request queued on the lock while
+                # the holder's own line said "0 job(s)": the wait was the
+                # lend_after window, and the two lines contradicted each other.
+                self._loading.behind = self._busy_label(resident, jobs, settling)
             log.info(
                 "%s has been idle long enough after %.0fs; %s takes the card",
                 resident.tag, time.monotonic() - started, incoming.tag,
             )
         finally:
             self._loading = previous
+
+    @staticmethod
+    def _busy_label(resident: Resident, jobs: int, settling: float) -> str:
+        """What a displacing load is waiting on, said the same way everywhere."""
+        if jobs > 0:
+            return f"{resident.tag}'s {jobs} running job(s)"
+        return f"{resident.tag}'s lend_after window ({settling:.0f}s left)"
 
     async def _restore_displaced(self) -> None:
         """Start back up what a borrow displaced, once nothing else is resident.
