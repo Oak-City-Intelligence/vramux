@@ -134,11 +134,16 @@ class Resident:
     # Monotonic time its busy_path queue was last seen non-empty, or it came
     # up, whichever is later. `lend_after` counts from here.
     last_busy: float = 0.0
-    # Held by the render scheduler. Its lend_after is waived — nobody is about
-    # to queue a job on it, the scheduler already has — and a load that
-    # displaces it does not remember it for `restore_after`: bringing it back
-    # for nobody is the flap the scheduler exists to stop.
+    # Held by the render scheduler right now. Its lend_after is waived —
+    # nobody is about to queue a job on it, the scheduler already has. Cleared
+    # by the scheduler's own release, which also counts the window as served,
+    # so the flip-back is not held and the next human job is.
     scheduled: bool = False
+    # Brought up or taken over by the scheduler, and not asked for by hand
+    # since. A load that displaces it does not remember it for
+    # `restore_after`: bringing it back for nobody is the flap the scheduler
+    # exists to stop.
+    scheduler_owned: bool = False
 
     def __post_init__(self) -> None:
         self.drained.set()
@@ -439,10 +444,10 @@ class ResidencyArbiter:
                 roomed = loaded = time.monotonic()
             self._displaced.pop(spec.tag, None)
             if scheduled:
-                resident.scheduled = True
+                resident.scheduled = resident.scheduler_owned = True
             elif self._render_hold is None:
                 # Somebody asked for it by hand: its own protections are back.
-                resident.scheduled = False
+                resident.scheduled = resident.scheduler_owned = False
             resident.inflight += 1
             resident.drained.clear()
             resident.last_use = time.monotonic()
@@ -518,7 +523,7 @@ class ResidencyArbiter:
             "parked": len(parked),
         }
 
-    def release(self, tag: Optional[str] = None) -> None:
+    def release(self, tag: Optional[str] = None, *, scheduled: bool = False) -> None:
         """Mark one in-flight request complete; wake a waiting eviction at zero.
 
         `tag` names the resident the request was acquired on, and now that more
@@ -543,6 +548,14 @@ class ResidencyArbiter:
             # The resident was force-evicted out from under a request that
             # overran the drain timeout. Nothing left to decrement.
             return
+        if scheduled:
+            # The scheduler letting go. Its waiver ends here; the lend_after
+            # window counts as already served, so the request parked for the
+            # flip-back is not held, and the next job somebody queues on the
+            # stack restarts the window as it would for any resident.
+            resident.scheduled = False
+            window = resident.spec.lend_after or 0.0
+            resident.last_busy = min(resident.last_busy, time.monotonic() - window)
         resident.inflight = max(0, resident.inflight - 1)
         if resident.inflight == 0:
             resident.drained.set()
@@ -851,7 +864,7 @@ class ResidencyArbiter:
             log.info("swapping model: %s -> %s", resident.tag, incoming.tag)
             if (
                 resident.spec.restore_after is not None
-                and not resident.scheduled
+                and not resident.scheduler_owned
                 and not self._scheduling
             ):
                 self._displaced[resident.tag] = resident.spec

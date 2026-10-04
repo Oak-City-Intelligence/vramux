@@ -324,7 +324,7 @@ class Scheduler:
         finally:
             released = time.monotonic()
             parked = len(self.arbiter.parked)
-            self.arbiter.release(spec.tag)
+            self.arbiter.release(spec.tag, scheduled=True)
             self.arbiter.release_render()
             self.mode, self.render_model = LLM, None
             log.info("render over on %s (%s); %d request(s) were parked",

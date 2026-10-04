@@ -87,3 +87,29 @@ async def test_what_a_render_displaces_is_not_remembered():
     await sup.acquire(img, scheduled=True, timings=timings)
     assert not sup._displaced
     assert set(timings) == {"evict_s", "load_s"}
+
+
+async def test_after_the_scheduler_lets_go_the_stack_is_an_ordinary_resident():
+    """The waiver covers the flip-back, not the stack's whole life: a human's
+    next job on it is protected by lend_after again."""
+    sup = QueueArbiter(drain_timeout=0.2, startup_timeout=5.0, busy_wait=5.0)
+    img, llm = stack(lend_after=60), spec("llm:27b")
+    sup.hold_render("stack:1")
+    await sup.acquire(img, scheduled=True)
+    sup.jobs["stack:1"] = 1                       # our last workflow, still on it
+    assert await sup._busy_jobs(sup._residents["stack:1"]) == 1
+    sup.jobs["stack:1"] = 0
+    sup.release("stack:1", scheduled=True)
+    sup.release_render()
+    resident = sup._residents["stack:1"]
+    assert not resident.scheduled
+    assert sup._settling(resident) == 0, "the flip-back itself is not held"
+
+    sup.jobs["stack:1"] = 1                       # somebody at the UI queues
+    await sup._busy_jobs(resident)
+    sup.jobs["stack:1"] = 0
+    load = asyncio.create_task(sup.acquire(llm))
+    await asyncio.sleep(0.1)
+    assert not load.done(), "lend_after protects the human's next use"
+    load.cancel()
+
