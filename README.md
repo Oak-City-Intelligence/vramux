@@ -80,6 +80,27 @@ not defended.
   seconds, counting from when it came up. A client that loads it and then
   uploads and queues is not beaten to the card by a request already parked
   behind the load
+- render jobs, for a workflow-server entry with `jobs: comfy`: the card is
+  shared between language models and renders in time slices, not flipped per
+  request. `POST /gpu/jobs {model, workflows: [...]}` (or `workflow: {...}`)
+  queues a batch and answers `202 {id, state, position}` at once. A scheduler
+  holds the jobs while language models work, flips to render when a trigger
+  fires, runs every pending workflow one at a time under that one flip, and
+  flips back; chat requests that arrive meanwhile park behind it. Triggers,
+  typed per entry, each off unless set:
+  - `render_start_deadline: S` — the oldest pending job has waited S seconds
+  - `render_batch_trigger: N` — N jobs are pending
+  - `llm_latency_bound: S` — once a parked chat request has waited S seconds,
+    stop after the running workflow and flip back
+  With none set, jobs run once no chat request has arrived for ten seconds.
+  `GET /gpu/jobs/{id}?wait=1&timeout=S` holds until the job finishes (or S
+  seconds; default 300, at most 3600) and returns each workflow's outputs
+  with a `/view` URL; `DELETE /gpu/jobs/{id}` cancels what has not started.
+  `POST /gpu/jobs/window {model, jobs: N | minutes: T}` holds render mode for
+  somebody at the stack's own UI until N prompts complete or its queue sits
+  empty T minutes; `DELETE /gpu/jobs/window` ends it. Jobs survive a restart
+  (`vramux/jobs.json` under the XDG state dir, or `VRAMUX_JOBS_FILE`); each handover
+  is timed both ways, logged, and shown by `vramux top`
 
 ## Install
 
@@ -136,6 +157,7 @@ documents both backend kinds.
 | `VRAMUX_QUEUE_WAIT` | `600` | seconds an outranked load request parks behind a higher-priority lease before refusing; `0` fails fast |
 | `VRAMUX_SAMPLE_INTERVAL` | `300` | seconds between usage-history samples; clamped up to the 5 s lease sweep it rides on |
 | `VRAMUX_EVENT_INTERVAL` | `1` | seconds between readings while a console is watching; nothing is read when none is |
+| `VRAMUX_JOBS_FILE` | `vramux/jobs.json` in the XDG state dir | where queued and recent render jobs are kept |
 | `VRAMUX_EVENT_KEEPALIVE` | `15` | seconds of an unchanged card before the event stream sends a comment line |
 
 The older `MYLLAMA_*` names still work, warning once each.
