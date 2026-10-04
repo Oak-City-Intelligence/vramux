@@ -39,6 +39,8 @@ class FakeStack:
         self.gate = None           # an Event a test holds a render on
         self.fail = set()          # submission numbers that error
         self.refuse = set()        # submission numbers refused at /prompt
+        self.slow_post = 0.0       # seconds /prompt sits on its answer
+        self.extra = {}            # prompt_id -> extra_data, as the stack keeps it
         self._n = 0
 
     def app(self) -> web.Application:
@@ -64,8 +66,14 @@ class FakeStack:
                  "node_errors": {"3": "bad"}}, status=400,
             )
         pid = f"p{n}"
+        extra = dict(body.get("extra_data") or {})
+        if "client_id" in body:
+            extra["client_id"] = body["client_id"]
+        self.extra[pid] = extra
         self.queue.append([n, pid])
         asyncio.get_running_loop().create_task(self._render(n, pid))
+        if self.slow_post:
+            await asyncio.sleep(self.slow_post)   # queued, but the answer is late
         return web.json_response({"prompt_id": pid, "number": n})
 
     async def _render(self, n, pid):
@@ -76,8 +84,9 @@ class FakeStack:
 
     def complete(self, pid, error=False):
         self.queue = [row for row in self.queue if row[1] != pid]
+        row = [0, pid, {}, self.extra.get(pid, {}), []]
         if error:
-            self.history[pid] = {"outputs": {}, "status": {
+            self.history[pid] = {"prompt": row, "outputs": {}, "status": {
                 "status_str": "error", "completed": False,
                 "messages": [["execution_error", {
                     "node_id": "7", "node_type": "KSampler",
@@ -85,6 +94,7 @@ class FakeStack:
             }}
         else:
             self.history[pid] = {
+                "prompt": row,
                 "outputs": {"9": {"images": [
                     {"filename": f"{pid}.png", "subfolder": "", "type": "output"}]}},
                 "status": {"status_str": "success", "completed": True, "messages": []},
@@ -99,8 +109,8 @@ class FakeStack:
 
     async def get_queue(self, _request):
         return web.json_response({
-            "queue_running": [r + [{}, {}, []] for r in self.queue[:1]],
-            "queue_pending": [r + [{}, {}, []] for r in self.queue[1:]],
+            "queue_running": [r + [{}, self.extra.get(r[1], {}), []] for r in self.queue[:1]],
+            "queue_pending": [r + [{}, self.extra.get(r[1], {}), []] for r in self.queue[1:]],
         })
 
 
@@ -618,3 +628,38 @@ async def test_a_count_window_counts_only_the_humans_prompts(rig):
     await asyncio.sleep(0.1)
     fake.complete("human-2")
     await until(lambda: sch.mode == LLM)
+
+
+# ---- a late answer from /prompt -------------------------------------------------
+
+
+async def test_a_prompt_whose_answer_timed_out_is_found_not_resubmitted(rig, monkeypatch):
+    fake, build = rig
+    monkeypatch.setattr(sched_mod, "QUIET_GRACE", 0.0)
+    monkeypatch.setattr(sched_mod, "_PROMPT_TIMEOUT", 0.1)
+    fake.slow_post = 0.5
+    fake.render_s = 0.05
+    _arbiter, _stack, store, sch = build()
+    job = store.submit(STACK, [{"a": {}}])
+    sch.start()
+    await until(lambda: job.terminal)
+    assert job.state == DONE
+    assert fake.prompts == [{"a": {}}], "the stack had it; it was not sent twice"
+    assert job.workflows[0].prompt_id == "p0" and job.workflows[0].attempts == 1
+
+
+async def test_a_restored_workflow_with_no_prompt_id_is_looked_for_first(rig, tmp_path, monkeypatch):
+    fake, build = rig
+    monkeypatch.setattr(sched_mod, "QUIET_GRACE", 0.0)
+    store = JobStore(tmp_path / "jobs.json")
+    job = store.submit(STACK, [{"a": {}}])
+    wf = job.workflows[0]
+    store.mark_running(job, wf)
+    wf.attempts = 1                    # crashed after the POST, before the answer
+    fake.extra["p-early"] = {"vramux": {"job": job.id, "workflow": 0}}
+    fake.complete("p-early")
+    _arbiter, _stack, _st, sch = build(store=store)
+    sch.start()
+    await until(lambda: job.terminal)
+    assert job.state == DONE and wf.prompt_id == "p-early"
+    assert fake.prompts == []

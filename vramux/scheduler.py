@@ -96,8 +96,13 @@ def retry_after(failures: int) -> float:
 # the other atomically, but two reads are not atomic.
 _GONE_AFTER = 2
 
-# Per request to the stack. Generous: a /prompt POST validates the whole graph.
+# Per request to the stack.
 _HTTP_TIMEOUT = 60.0
+
+# For a /prompt POST, which validates the whole graph before answering. A
+# timeout here does not mean the prompt was not queued — so the marker it
+# carries is looked for before anything is submitted again.
+_PROMPT_TIMEOUT = 60.0
 
 
 class _Lost(Exception):
@@ -481,6 +486,11 @@ class Scheduler:
                 return
             log.info("job %s workflow %d: prompt %s is gone from %s",
                      job.id, wf.index, wf.prompt_id, spec.tag)
+        elif wf.state == RUNNING and await self._adopt(base, job, wf):
+            # Sent, but the answer never came back (a timeout, or a crash
+            # between the POST and its reply): the stack may well have it.
+            await self._follow(spec, base, job, wf)
+            return
         if wf.attempts >= MAX_ATTEMPTS:
             self.store.mark_failed(
                 job, wf, f"lost by {spec.tag} after {wf.attempts} submission(s) "
@@ -500,11 +510,20 @@ class Scheduler:
         assert self._session is not None
         try:
             async with self._session.post(
-                f"{base}/prompt", json={"prompt": wf.prompt, "client_id": f"vramux-{job.id}"},
+                f"{base}/prompt",
+                json={
+                    "prompt": wf.prompt, "client_id": f"vramux-{job.id}",
+                    # Kept by the stack with the prompt, in its queue and its
+                    # history: how a submit whose answer was lost is found.
+                    "extra_data": {"vramux": self._marker(job, wf)},
+                },
+                timeout=aiohttp.ClientTimeout(total=_PROMPT_TIMEOUT),
             ) as resp:
                 body = await resp.json(content_type=None)
                 status = resp.status
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+            if await self._adopt(base, job, wf):
+                return
             raise _Lost(f"POST /prompt failed: {exc}") from None
         if status != 200 or not isinstance(body, dict) or not body.get("prompt_id"):
             # Refused at validation: the graph is wrong, and submitting it
@@ -523,6 +542,42 @@ class Scheduler:
         self.store.changed()
         log.info("job %s workflow %d submitted to %s as %s",
                  job.id, wf.index, spec.tag, wf.prompt_id)
+
+    @staticmethod
+    def _marker(job: Job, wf: Workflow) -> Dict[str, Any]:
+        return {"job": job.id, "workflow": wf.index}
+
+    async def _adopt(self, base: str, job: Job, wf: Workflow) -> bool:
+        """Find this workflow's prompt on the stack by its marker and take
+        its id. True if found. Rows in both the queue and the history carry
+        the prompt as [number, prompt_id, graph, extra_data, outputs]."""
+        marker = self._marker(job, wf)
+
+        def mine(row) -> bool:
+            return (
+                isinstance(row, list) and len(row) > 3 and isinstance(row[3], dict)
+                and row[3].get("vramux") == marker
+            )
+
+        found = None
+        queue = await self._get_json(f"{base}/queue")
+        for rows in (queue.values() if isinstance(queue, dict) else []):
+            for row in rows if isinstance(rows, list) else []:
+                if mine(row):
+                    found = str(row[1])
+        if found is None:
+            history = await self._get_json(f"{base}/history")
+            for pid, entry in (history.items() if isinstance(history, dict) else []):
+                if isinstance(entry, dict) and mine(entry.get("prompt")):
+                    found = str(pid)
+        if found is None:
+            return False
+        wf.prompt_id = found
+        self._submitted.add(found)
+        self.store.changed()
+        log.info("job %s workflow %d: found its prompt on the stack as %s; "
+                 "not submitting it again", job.id, wf.index, found)
+        return True
 
     async def _follow(self, spec: ModelSpec, base: str, job: Job, wf: Workflow) -> None:
         """Wait for the prompt's history entry. No cap: a render is as long
